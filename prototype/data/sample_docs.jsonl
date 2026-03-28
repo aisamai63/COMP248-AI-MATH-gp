@@ -1,0 +1,2 @@
+{"id": "doc1", "title": "Quadratic Formula", "source": "math_textbook", "text": "The quadratic formula solves ax^2 + bx + c = 0. Solutions are x = (-b ± sqrt(b^2 - 4ac)) / (2a)."}
+{"id": "doc2", "title": "Pythagorean Theorem", "source": "math_textbook", "text": "In a right triangle with legs a and b and hypotenuse c, a^2 + b^2 = c^2."}
