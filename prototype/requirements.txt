@@ -8,3 +8,4 @@ python-dotenv
 pypdf
 tensorflow
 keras
+google-generativeai
