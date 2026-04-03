@@ -1,3 +1,22 @@
+# Python virtual environments
 venv/
+.venv/
+
+# Environment files
 .env
+prototype/.env
+
+# Python cache/artifacts
 __pycache__/
+*.py[cod]
+
+# Local database and generated runtime artifacts
+prototype/.chroma_db/
+
+# Streamlit local cache/state
+.streamlit/secrets.toml
+prototype/.streamlit/secrets.toml
+
+# OS/editor noise
+desktop.ini
+.vscode/

@@ -1,0 +1,4 @@
+[server]
+# Avoid lazy-import scanning of optional Transformers vision modules
+# that can trigger torchvision import errors in text-only apps.
+fileWatcherType = "none"
