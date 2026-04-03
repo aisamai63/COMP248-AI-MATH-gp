@@ -16,6 +16,8 @@ Usage:
 """
 
 import logging
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +32,24 @@ CHROMA_DB_DIR = db_config.CHROMA_DB_DIR
 
 # Ensure directory exists
 Path(CHROMA_DB_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def _is_fatal_base_exception(exc: BaseException) -> bool:
+    """Return True for control-flow exceptions that should never be swallowed."""
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
+
+
+def _backup_corrupt_chroma_dir(persist_directory: str) -> Optional[Path]:
+    """Move a suspected-corrupt Chroma directory aside and recreate it."""
+    db_dir = Path(persist_directory)
+    if not db_dir.exists():
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = db_dir.with_name(f"{db_dir.name}_corrupt_{timestamp}")
+    shutil.move(str(db_dir), str(backup_dir))
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return backup_dir
 
 
 def get_chroma_client(
@@ -57,25 +77,70 @@ def get_chroma_client(
     # Ensure directory exists
     Path(persist_directory).mkdir(parents=True, exist_ok=True)
 
-    try:
-        # Create persistent client with the new Chroma API.
-        settings = Settings(
-            anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
-            allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
-        )
+    # Create persistent client with the new Chroma API.
+    settings = Settings(
+        anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
+        allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
+    )
 
-        client = chromadb.PersistentClient(
+    def _build_persistent_client() -> chromadb.Client:
+        return chromadb.PersistentClient(
             path=persist_directory,
             settings=settings,
         )
+
+    try:
+        client = _build_persistent_client()
         logger.info(
             f"✓ ChromaDB client initialized (persisting to {persist_directory})"
         )
         return client
 
-    except Exception as e:
+    except BaseException as e:
+        if _is_fatal_base_exception(e):
+            raise
+        # pyo3_runtime.PanicException may derive from BaseException, not Exception.
         logger.error(f"✗ Failed to initialize ChromaDB client: {e}")
-        raise
+
+        try:
+            backup_dir = _backup_corrupt_chroma_dir(persist_directory)
+            if backup_dir is not None:
+                logger.warning(
+                    "Moved possibly-corrupt Chroma directory to '%s'; retrying fresh DB.",
+                    backup_dir,
+                )
+                client = _build_persistent_client()
+                logger.info(
+                    "✓ ChromaDB client initialized after recovery (persisting to %s)",
+                    persist_directory,
+                )
+                return client
+        except BaseException as retry_exc:
+            if _is_fatal_base_exception(retry_exc):
+                raise
+            logger.error("✗ ChromaDB recovery retry failed: %s", retry_exc)
+
+        # Compatibility fallback: older client initialization path can work on
+        # some environments where the rust-backed PersistentClient fails.
+        try:
+            legacy_settings = Settings(
+                is_persistent=True,
+                persist_directory=persist_directory,
+                anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
+                allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
+            )
+            client = chromadb.Client(settings=legacy_settings)
+            logger.warning(
+                "ChromaDB initialized via legacy client compatibility mode at %s",
+                persist_directory,
+            )
+            return client
+        except BaseException as legacy_exc:
+            if _is_fatal_base_exception(legacy_exc):
+                raise
+            logger.error("✗ ChromaDB legacy compatibility mode failed: %s", legacy_exc)
+
+        raise RuntimeError(f"ChromaDB initialization failed: {e}") from None
 
 
 def get_chroma_collection(

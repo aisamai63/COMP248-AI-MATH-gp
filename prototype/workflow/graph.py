@@ -40,6 +40,7 @@ Key Design Decisions:
 """
 
 import logging
+import time
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from prototype.workflow.state import WorkflowState, initialize_state
@@ -51,6 +52,7 @@ from prototype.agents import (
     ToolAgent,
 )
 from prototype.chroma_retrieval import ChromaDBRetriever
+from prototype.config import reflection_config, runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -108,13 +110,17 @@ class MathInquiriesGraph:
         planner = PlannerAgent()
         retriever = RetrieverAgent(self.retriever)
         summarizer = SummarizerAgent(use_llm=True)
-        reflector = ReflectiveAgent()
+        reflector = ReflectiveAgent(use_llm=not runtime_config.FAST_MODE)
         tool_agent = ToolAgent()
 
         # Define node functions (wrapper for agents)
         def planner_node(state: WorkflowState) -> WorkflowState:
             """Planner node: classify query and decide retrieval params."""
+            started = time.perf_counter()
             updated = planner.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | planner | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["planner"] = elapsed
             # Planner writes rich decision payload directly; keep sequence here.
             _record_node_metadata(
                 updated,
@@ -125,7 +131,11 @@ class MathInquiriesGraph:
 
         def retriever_node(state: WorkflowState) -> WorkflowState:
             """Retriever node: RAG - get documents."""
+            started = time.perf_counter()
             updated = retriever.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | retriever | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["retriever_total"] = elapsed
             docs = updated.get("retrieved_docs", [])
             _record_node_metadata(
                 updated,
@@ -149,7 +159,11 @@ class MathInquiriesGraph:
 
         def summarizer_node(state: WorkflowState) -> WorkflowState:
             """Summarizer node: generate summary."""
+            started = time.perf_counter()
             updated = summarizer.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | summarizer | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["summarizer_total"] = elapsed
             summary_text = updated.get("summary", "")
             _record_node_metadata(
                 updated,
@@ -166,7 +180,11 @@ class MathInquiriesGraph:
 
         def reflector_node(state: WorkflowState) -> WorkflowState:
             """Reflector node: evaluate quality."""
+            started = time.perf_counter()
             updated = reflector.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | reflector | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["reflector_total"] = elapsed
             metrics = updated.get("reflection_metrics", {})
             _record_node_metadata(
                 updated,
@@ -186,7 +204,11 @@ class MathInquiriesGraph:
                 tool_agent = ToolAgent()
                 state = tool_agent.run(state)
             """
+            started = time.perf_counter()
             updated = tool_agent.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | tool_agent | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["tool_agent_total"] = elapsed
             _record_node_metadata(
                 updated,
                 "tool_agent",
@@ -243,6 +265,19 @@ class MathInquiriesGraph:
         if not state["reflection_metrics"]:
             return "continue"
 
+        # FAST_MODE: skip iterative retry loop for near-instant responses.
+        if runtime_config.FAST_MODE:
+            state["metadata"].setdefault("trace", []).append(
+                {
+                    "node": "reflector",
+                    "iteration": state["iteration_count"],
+                    "decision": "continue",
+                    "reason": "fast_mode",
+                }
+            )
+            logger.info("FAST_MODE enabled: skipping retry loop")
+            return "continue"
+
         # Check confidence
         confidence = state["reflection_metrics"].get("confidence", 0.0)
         iteration = state["iteration_count"]
@@ -297,6 +332,7 @@ class MathInquiriesGraph:
             Final state dict with all results
         """
         logger.info(f"Starting workflow for query: {user_query}")
+        workflow_started = time.perf_counter()
 
         # Initialize state
         initial_state = initialize_state(user_query)
@@ -304,9 +340,13 @@ class MathInquiriesGraph:
         # Execute graph
         final_state = self.compiled_graph.invoke(initial_state)
 
+        total_elapsed = time.perf_counter() - workflow_started
+        final_state["metadata"]["timestamps"]["workflow_total"] = total_elapsed
+
         logger.info(
             f"Workflow completed after {final_state['iteration_count']} iterations"
         )
+        logger.info("Timing | workflow_total | %.3fs", total_elapsed)
         return final_state
 
     def get_graph_structure(self) -> str:
@@ -342,10 +382,6 @@ class MathInquiriesGraph:
                 parts.append(f"decision={decision}")
             lines.append(" | ".join(parts))
         return "\n".join(lines)
-
-
-# Import config here to avoid circular imports
-from prototype.config import reflection_config
 
 
 def create_graph(retriever: ChromaDBRetriever = None) -> MathInquiriesGraph:

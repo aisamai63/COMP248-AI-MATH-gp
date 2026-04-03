@@ -33,6 +33,19 @@ class ToolAgent(BaseAgent):
                 outputs = self.registry.execute_many(selected_tools, query)
                 state["tool_results"] = self._format_tool_results(outputs)
 
+                # If calculator succeeded, use it as authoritative answer.
+                for item in outputs:
+                    if item.get("tool") != "calculator":
+                        continue
+                    result_text = str(item.get("result", ""))
+                    if result_text.startswith("Calculator failed"):
+                        continue
+                    if result_text.strip():
+                        state["summary"] = result_text
+                        # Avoid duplicate noisy tool panel for successful calculator outputs.
+                        state["tool_results"] = None
+                    break
+
             elapsed = time.time() - start_time
             state["metadata"]["timestamps"]["tool_agent"] = elapsed
             state["metadata"]["decisions"]["tool_agent"] = {

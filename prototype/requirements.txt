@@ -1,7 +1,11 @@
 streamlit
 langchain
+langgraph
 openai
+google-generativeai
 chromadb
+crewai
+litellm
 sentence-transformers
 tqdm
 python-dotenv

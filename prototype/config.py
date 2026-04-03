@@ -39,12 +39,27 @@ class RAGConfig:
 class LLMConfig:
     """LLM (Language Model) configuration."""
 
+    # Provider selection: mistral | openai | gemini
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mistral").strip().lower()
+
     # Mistral settings
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
     MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+
+    # OpenAI settings
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # Gemini settings
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+
     MISTRAL_TEMPERATURE: float = 0.2  # Lower = more deterministic
-    MISTRAL_MAX_TOKENS_DEFAULT: int = 120
-    MISTRAL_MAX_TOKENS_REFLECTION: int = 80
+    # Balanced mode defaults: faster responses with acceptable quality.
+    MISTRAL_MAX_TOKENS_DEFAULT: int = int(os.getenv("MISTRAL_MAX_TOKENS_DEFAULT", "90"))
+    MISTRAL_MAX_TOKENS_REFLECTION: int = int(
+        os.getenv("MISTRAL_MAX_TOKENS_REFLECTION", "50")
+    )
 
 
 @dataclass
@@ -126,6 +141,16 @@ class IngestionConfig:
     INGEST_BATCH_SIZE: int = int(os.getenv("INGEST_BATCH_SIZE", "100"))
 
 
+@dataclass
+class RuntimeConfig:
+    """Runtime behavior toggles for demo/performance modes."""
+
+    # FAST_MODE reduces latency by disabling expensive loops/LLM reflection.
+    FAST_MODE: bool = _bool_env("FAST_MODE", False)
+    # USE_CREWAI enables a thin CrewAI wrapper over the LangGraph execution path.
+    USE_CREWAI: bool = _bool_env("USE_CREWAI", False)
+
+
 # Global config instances (singleton pattern)
 rag_config = RAGConfig()
 llm_config = LLMConfig()
@@ -134,3 +159,4 @@ excerpt_config = ExcerptConfig()
 tool_config = ToolConfig()
 db_config = DatabaseConfig()
 ingestion_config = IngestionConfig()
+runtime_config = RuntimeConfig()

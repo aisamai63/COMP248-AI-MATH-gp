@@ -19,7 +19,7 @@ import time
 from typing import Optional
 from prototype.agents.base import BaseAgent
 from prototype.workflow.state import WorkflowState
-from prototype.config import llm_config
+from prototype.config import llm_config, runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -42,22 +42,57 @@ class SummarizerAgent(BaseAgent):
             use_llm: Whether to use LLM (True) or fallback (False)
         """
         super().__init__()
-        self.use_llm = use_llm
+        # FAST_MODE prioritizes latency over generation quality.
+        self.use_llm = use_llm and (not runtime_config.FAST_MODE)
         self.llm_ready = False
+        self.provider = llm_config.LLM_PROVIDER
         self.mistral_client = None
+        self.openai_client = None
+        self.gemini_model = None
 
-        if self.use_llm and llm_config.MISTRAL_API_KEY:
-            try:
-                from mistralai.client import Mistral
+        if self.use_llm:
+            self._initialize_llm_client()
+        elif runtime_config.FAST_MODE:
+            self.logger.info("FAST_MODE enabled: summarizer LLM disabled")
 
-                self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
+    def _initialize_llm_client(self) -> None:
+        """Initialize LLM client based on configured provider."""
+        try:
+            if self.provider == "gemini":
+                if not llm_config.GEMINI_API_KEY:
+                    self.logger.warning("GEMINI_API_KEY missing; using fallback.")
+                    return
+                import google.generativeai as genai
+
+                genai.configure(api_key=llm_config.GEMINI_API_KEY)
+                self.gemini_model = genai.GenerativeModel(llm_config.GEMINI_MODEL)
                 self.llm_ready = True
-                self.logger.info("Mistral client initialized successfully")
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to initialize Mistral: {e}. Using fallback."
-                )
-                self.llm_ready = False
+                self.logger.info("Gemini client initialized successfully")
+                return
+
+            if self.provider == "openai":
+                if not llm_config.OPENAI_API_KEY:
+                    self.logger.warning("OPENAI_API_KEY missing; using fallback.")
+                    return
+                from openai import OpenAI
+
+                self.openai_client = OpenAI(api_key=llm_config.OPENAI_API_KEY)
+                self.llm_ready = True
+                self.logger.info("OpenAI client initialized successfully")
+                return
+
+            # Default to Mistral for backward compatibility.
+            if not llm_config.MISTRAL_API_KEY:
+                self.logger.warning("MISTRAL_API_KEY missing; using fallback.")
+                return
+            from mistralai.client import Mistral
+
+            self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
+            self.llm_ready = True
+            self.logger.info("Mistral client initialized successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize {self.provider} client: {e}")
+            self.llm_ready = False
 
     def run(self, state: WorkflowState) -> WorkflowState:
         """
@@ -118,19 +153,65 @@ class SummarizerAgent(BaseAgent):
         try:
             prompt = self._build_summary_prompt(query, docs)
 
-            response = self.mistral_client.chat.complete(
-                model=llm_config.MISTRAL_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
-                temperature=llm_config.MISTRAL_TEMPERATURE,
+            llm_started = time.perf_counter()
+
+            if self.provider == "gemini" and self.gemini_model is not None:
+                response = self.gemini_model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": llm_config.MISTRAL_TEMPERATURE,
+                        "max_output_tokens": llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
+                    },
+                )
+                content = self._extract_gemini_text(response)
+            elif self.provider == "openai" and self.openai_client is not None:
+                response = self.openai_client.chat.completions.create(
+                    model=llm_config.OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
+                    temperature=llm_config.MISTRAL_TEMPERATURE,
+                )
+                content = response.choices[0].message.content or ""
+            else:
+                response = self.mistral_client.chat.complete(
+                    model=llm_config.MISTRAL_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
+                    temperature=llm_config.MISTRAL_TEMPERATURE,
+                )
+                content = response.choices[0].message.content
+
+            llm_elapsed = time.perf_counter() - llm_started
+            self.logger.info(
+                "Timing | summarizer_llm_call | provider=%s | %.3fs",
+                self.provider,
+                llm_elapsed,
             )
 
-            content = response.choices[0].message.content
             return content.strip()
 
         except Exception as e:
             self.logger.error(f"LLM summarization failed: {e}")
             return f"[Summarization error: {str(e)}]"
+
+    @staticmethod
+    def _extract_gemini_text(response) -> str:
+        """Extract text robustly from Gemini SDK response."""
+        text = getattr(response, "text", None)
+        if text:
+            return text
+
+        candidates = getattr(response, "candidates", None) or []
+        parts = []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    parts.append(part_text)
+        return "\n".join(parts).strip()
 
     def _summarize_fallback(self, query: str, docs: list) -> str:
         """
@@ -162,9 +243,9 @@ class SummarizerAgent(BaseAgent):
         Build prompt for LLM summarization.
 
         Instructs the LLM to:
-        - Answer the user's question
+        - Answer naturally and directly first
         - Use provided excerpts only
-        - Structure response in 3 sections: answer, bullet summary, related points
+        - Keep formatting minimal and readable
 
         Args:
             query: User query
@@ -177,10 +258,11 @@ class SummarizerAgent(BaseAgent):
             "You are an expert research assistant. Answer the user's question using ONLY "
             "the provided document excerpts. Do not use external knowledge.\n\n"
             f"USER QUESTION: {query}\n\n"
-            "RESPONSE FORMAT:\n"
-            "1. Direct Answer (1-2 sentences)\n"
-            "2. Key Points (3-5 bullet points)\n"
-            "3. Related Concepts (2-3 items if applicable)\n\n"
+            "RESPONSE STYLE:\n"
+            "- Start with a short direct answer in plain language.\n"
+            "- Add 2-4 bullet points only if they help clarity.\n"
+            "- Avoid numbered section headers unless explicitly requested.\n"
+            "- Keep it concise and classroom-friendly.\n\n"
             "DOCUMENTS:\n"
         )
 
@@ -190,5 +272,8 @@ class SummarizerAgent(BaseAgent):
             source = doc.get("source", "unknown")
             prompt += f"\n[Document {i}] {title} (source: {source})\n{excerpt}\n"
 
-        prompt += "\nPlease answer based only on the above documents."
+        prompt += (
+            "\nPlease answer based only on the above documents. "
+            "If the user has a typo, briefly interpret it and answer the intended question."
+        )
         return prompt

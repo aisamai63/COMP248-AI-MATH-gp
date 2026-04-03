@@ -5,6 +5,7 @@ Handles document loading, retrieval, and PDF support.
 
 import os
 import json
+import time
 from typing import List, Dict, Optional
 import logging
 from functools import lru_cache
@@ -29,6 +30,11 @@ except Exception as e:
     logging.warning(f"pypdf not available: {e}")
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "sample_docs.jsonl")
+
+
+def _is_fatal_base_exception(exc: BaseException) -> bool:
+    """Return True for control-flow exceptions that should not be caught."""
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
 
 def load_fallback_docs() -> List[Dict]:
@@ -82,6 +88,16 @@ def get_embedding_model():
     """
     Cached embedding model loader to avoid re-downloading/re-loading on each query.
     """
+    logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
+    try:
+        from transformers import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
     from sentence_transformers import SentenceTransformer
 
     return SentenceTransformer(rag_config.EMBEDDING_MODEL)
@@ -172,8 +188,11 @@ class KBClient:
                 distance_metric=db_config.CHROMADB_DISTANCE_METRIC,
             )
             logging.info("ChromaDB KBClient initialized")
-        except Exception as e:
+        except BaseException as e:
+            if _is_fatal_base_exception(e):
+                raise
             logging.warning(f"Failed to initialize ChromaDB client: {e}")
+            self.use_chromadb = False
             self.client = None
             self.collection = None
 
@@ -191,14 +210,19 @@ class KBClient:
             return False
 
     def _query_chromadb(self, query: str, k: int) -> List[Dict]:
+        started = time.perf_counter()
         model = self._get_embedding_model()
+        embed_started = time.perf_counter()
         query_embedding = model.encode([query])[0].tolist()
+        embed_elapsed = time.perf_counter() - embed_started
 
+        query_started = time.perf_counter()
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=min(k, rag_config.K_MAX),
             include=["documents", "metadatas", "distances"],
         )
+        query_elapsed = time.perf_counter() - query_started
 
         documents: List[Dict] = []
         docs = results.get("documents", [[]])[0] if results else []
@@ -222,12 +246,28 @@ class KBClient:
             }
             documents.append(prepared)
 
+        total_elapsed = time.perf_counter() - started
+        logging.info(
+            "Timing | chromadb | embed=%.3fs query=%.3fs total=%.3fs docs=%d",
+            embed_elapsed,
+            query_elapsed,
+            total_elapsed,
+            len(documents),
+        )
+
         return documents
 
     def _query_fallback(self, query: str, k: int) -> List[Dict]:
+        started = time.perf_counter()
         docs = list(load_fallback_docs_cached())
         docs = _attach_excerpts(docs, query)
         if not query:
+            elapsed = time.perf_counter() - started
+            logging.info(
+                "Timing | fallback_retrieval | %.3fs docs=%d",
+                elapsed,
+                min(k, len(docs)),
+            )
             return docs[:k]
 
         q = query.lower()
@@ -241,7 +281,12 @@ class KBClient:
         results = [d for s, d in scored if s > 0]
         if not results:
             results = docs
-        return results[:k]
+        output = results[:k]
+        elapsed = time.perf_counter() - started
+        logging.info(
+            "Timing | fallback_retrieval | %.3fs docs=%d", elapsed, len(output)
+        )
+        return output
 
     def get_documents(self, query: str, k: int = 5) -> List[Dict]:
         """Retrieve top-k documents using persistent ChromaDB, fallback when needed."""
@@ -250,8 +295,11 @@ class KBClient:
                 chroma_docs = self._query_chromadb(query, k)
                 if chroma_docs:
                     return chroma_docs
-            except Exception as e:
+            except BaseException as e:
+                if _is_fatal_base_exception(e):
+                    raise
                 logging.warning(f"ChromaDB query failed, using fallback: {e}")
+                self.use_chromadb = False
 
         return self._query_fallback(query, k)
 

@@ -38,13 +38,17 @@ Routing behavior (implemented in workflow graph):
 
 ## 2. Framework and Orchestration
 
-- Framework: LangGraph StateGraph
+- Framework: LangGraph StateGraph, optionally wrapped by a single-agent CrewAI shell
 - Entry point: PlannerAgent
 - Deterministic edges: planner -> retriever -> summarizer -> reflector
 - Conditional edge: reflector -> planner (retry) or tool_agent (continue)
 - Exit edge: tool_agent -> END
 
 This logic is implemented in prototype/workflow/graph.py.
+
+When `USE_CREWAI=true`, the runtime entry points call the LangGraph workflow through a thin CrewAI wrapper in `prototype/crewai_wrapper.py`. The underlying reasoning and state transitions remain unchanged.
+
+If the default Mistral provider is used, the CrewAI path relies on LiteLLM support so the wrapper can initialize the model cleanly.
 
 ## 3. Retrieval and Knowledge Base (RAG)
 

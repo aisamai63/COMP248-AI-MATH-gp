@@ -26,7 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from prototype.workflow import create_graph
+from prototype.workflow import create_runtime_graph
 
 # Configure logging (detailed output for debugging)
 logging.basicConfig(
@@ -51,7 +51,7 @@ def demo_query(query: str) -> Dict[str, Any]:
     logger.info("=" * 80)
 
     # Create graph
-    graph = create_graph()
+    graph = create_runtime_graph()
 
     # Run workflow
     result = graph.run(query)

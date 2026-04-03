@@ -10,6 +10,7 @@ Returns structured JSON-compatible metrics for planner loop integration.
 """
 
 import json
+import importlib
 import logging
 import re
 import time
@@ -17,7 +18,7 @@ from typing import Any, Dict, List
 
 from prototype.agents.base import BaseAgent
 from prototype.workflow.state import WorkflowState
-from prototype.config import llm_config, reflection_config
+from prototype.config import llm_config, reflection_config, runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +30,60 @@ class ReflectiveAgent(BaseAgent):
 
     def __init__(self, use_llm: bool = True):
         super().__init__()
-        self.use_llm = use_llm
+        self.use_llm = use_llm and (not runtime_config.FAST_MODE)
         self.llm_ready = False
+        self.provider = llm_config.LLM_PROVIDER
         self.mistral_client = None
+        self.openai_client = None
+        self.gemini_model = None
 
-        if self.use_llm and llm_config.MISTRAL_API_KEY:
-            try:
-                from mistralai.client import Mistral
+        if self.use_llm:
+            self._initialize_llm_client()
+        elif runtime_config.FAST_MODE:
+            self.logger.info("FAST_MODE enabled: reflector LLM disabled")
 
-                self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
+    def _initialize_llm_client(self) -> None:
+        """Initialize LLM client based on configured provider."""
+        try:
+            if self.provider == "gemini":
+                if not llm_config.GEMINI_API_KEY:
+                    self.logger.warning(
+                        "GEMINI_API_KEY missing; reflector uses fallback."
+                    )
+                    return
+                genai = importlib.import_module("google.generativeai")
+
+                genai.configure(api_key=llm_config.GEMINI_API_KEY)
+                self.gemini_model = genai.GenerativeModel(llm_config.GEMINI_MODEL)
                 self.llm_ready = True
-                self.logger.info("LLM reflection enabled (Mistral)")
-            except Exception as exc:
-                self.logger.warning(f"Failed to init Mistral for reflection: {exc}")
-                self.llm_ready = False
+                self.logger.info("LLM reflection enabled (Gemini)")
+                return
+
+            if self.provider == "openai":
+                if not llm_config.OPENAI_API_KEY:
+                    self.logger.warning(
+                        "OPENAI_API_KEY missing; reflector uses fallback."
+                    )
+                    return
+                openai_module = importlib.import_module("openai")
+                OpenAI = getattr(openai_module, "OpenAI")
+
+                self.openai_client = OpenAI(api_key=llm_config.OPENAI_API_KEY)
+                self.llm_ready = True
+                self.logger.info("LLM reflection enabled (OpenAI)")
+                return
+
+            if not llm_config.MISTRAL_API_KEY:
+                self.logger.warning("MISTRAL_API_KEY missing; reflector uses fallback.")
+                return
+            from mistralai.client import Mistral
+
+            self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
+            self.llm_ready = True
+            self.logger.info("LLM reflection enabled (Mistral)")
+        except Exception as exc:
+            self.logger.warning(f"Failed to init {self.provider} for reflection: {exc}")
+            self.llm_ready = False
 
     def run(self, state: WorkflowState) -> WorkflowState:
         """Evaluate current summary and update reflection_metrics in state."""
@@ -113,13 +154,39 @@ class ReflectiveAgent(BaseAgent):
         """Prompt-based evaluation with strict JSON output contract."""
         prompt = self._build_evaluation_prompt(query=query, summary=summary, docs=docs)
 
-        response = self.mistral_client.chat.complete(
-            model=llm_config.MISTRAL_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
-            temperature=0.0,
+        llm_started = time.perf_counter()
+        if self.provider == "gemini" and self.gemini_model is not None:
+            response = self.gemini_model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.0,
+                    "max_output_tokens": llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
+                },
+            )
+            raw = self._extract_gemini_text(response).strip()
+        elif self.provider == "openai" and self.openai_client is not None:
+            response = self.openai_client.chat.completions.create(
+                model=llm_config.OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
+                temperature=0.0,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+        else:
+            response = self.mistral_client.chat.complete(
+                model=llm_config.MISTRAL_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
+                temperature=0.0,
+            )
+            raw = response.choices[0].message.content.strip()
+
+        llm_elapsed = time.perf_counter() - llm_started
+        self.logger.info(
+            "Timing | reflector_llm_call | provider=%s | %.3fs",
+            self.provider,
+            llm_elapsed,
         )
-        raw = response.choices[0].message.content.strip()
 
         parsed = self._extract_json(raw)
         validated = self._validate_schema(parsed)
@@ -139,6 +206,25 @@ class ReflectiveAgent(BaseAgent):
             "feedback_text": validated["feedback_text"],
             "evaluation_source": "llm",
         }
+
+    @staticmethod
+    def _extract_gemini_text(response) -> str:
+        """Extract text robustly from Gemini SDK response."""
+        text = getattr(response, "text", None)
+        if text:
+            return text
+
+        candidates = getattr(response, "candidates", None) or []
+        parts = []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    parts.append(part_text)
+        return "\n".join(parts)
 
     def _build_evaluation_prompt(
         self, query: str, summary: str, docs: List[Dict[str, Any]]

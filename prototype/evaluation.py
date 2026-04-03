@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from prototype.workflow import create_graph
+from prototype.workflow import create_runtime_graph
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ def _mean_similarity(docs: List[Dict[str, Any]]) -> float:
 
 
 def run_evaluation(queries: List[str]) -> List[Dict[str, str]]:
-    graph = create_graph()
+    graph = create_runtime_graph()
     rows: List[Dict[str, str]] = []
 
     for query in queries:

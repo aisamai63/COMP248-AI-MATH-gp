@@ -16,10 +16,11 @@ Flow:
 """
 
 import logging
+import re
 from typing import Dict, Any, Tuple
 from prototype.agents.base import BaseAgent
 from prototype.workflow.state import WorkflowState
-from prototype.config import reflection_config, rag_config
+from prototype.config import reflection_config, rag_config, runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,9 @@ class PlannerAgent(BaseAgent):
         """
         iteration = state["iteration_count"]
 
+        if runtime_config.FAST_MODE:
+            return min(3, rag_config.K_DEFAULT)
+
         # First pass uses default breadth.
         if iteration <= 1:
             return rag_config.K_DEFAULT
@@ -214,7 +218,14 @@ class PlannerAgent(BaseAgent):
         tools = []
         query_lower = query.lower()
 
-        if query_type == "calculation":
+        equation_like = bool(
+            re.search(r"[a-z].*=|=.*[a-z]|\d+[a-z]|[a-z]\d+", query_lower)
+        )
+        matrix_like = any(
+            tok in query_lower for tok in ["matrix", "row echelon", "rref", "ref"]
+        )
+
+        if query_type == "calculation" or equation_like or matrix_like:
             tools.append("calculator")
 
         if any(keyword in query_lower for keyword in self.web_search_keywords):
