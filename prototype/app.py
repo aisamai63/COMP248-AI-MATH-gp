@@ -240,6 +240,15 @@ def _render_diagnostics(result: Dict[str, object]) -> None:
     metrics = result.get("reflection_metrics", {}) or {}
     docs = result.get("retrieved_docs", []) or []
     metadata = result.get("metadata", {}) or {}
+    summarizer_meta = metadata.get("decisions", {}).get("summarizer", {}) or {}
+    reflection_source = metrics.get("evaluation_source", "") or ""
+
+    if summarizer_meta.get("mode") == "fallback":
+        reason = summarizer_meta.get("reason", "fallback summary used")
+        st.warning(f"Summary fallback active: {reason}")
+
+    if reflection_source and reflection_source != "llm":
+        st.info(f"Reflection fallback active: {reflection_source}")
 
     st.markdown('<div class="diag-card">', unsafe_allow_html=True)
     st.markdown('<div class="diag-title">Diagnostics</div>', unsafe_allow_html=True)

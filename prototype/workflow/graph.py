@@ -165,13 +165,23 @@ class MathInquiriesGraph:
             logger.info("Timing | summarizer | %.3fs", elapsed)
             updated["metadata"]["timestamps"]["summarizer_total"] = elapsed
             summary_text = updated.get("summary", "")
+            summarizer_decision = (
+                updated.get("metadata", {}).get("decisions", {}).get("summarizer", {})
+            )
             _record_node_metadata(
                 updated,
                 "summarizer",
                 {
-                    "mode": (
-                        "llm" if getattr(summarizer, "llm_ready", False) else "fallback"
+                    "mode": summarizer_decision.get(
+                        "mode",
+                        (
+                            "llm"
+                            if getattr(summarizer, "llm_ready", False)
+                            else "fallback"
+                        ),
                     ),
+                    "provider": summarizer_decision.get("provider"),
+                    "reason": summarizer_decision.get("reason"),
                     "summary_word_count": len(summary_text.split()),
                     "had_documents": len(updated.get("retrieved_docs", [])) > 0,
                 },

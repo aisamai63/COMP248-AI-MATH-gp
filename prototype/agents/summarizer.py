@@ -106,12 +106,21 @@ class SummarizerAgent(BaseAgent):
         """
         try:
             start_time = time.time()
+            metadata = state.setdefault("metadata", {})
+            timestamps = metadata.setdefault("timestamps", {})
+            decisions = metadata.setdefault("decisions", {})
 
             docs = state["retrieved_docs"]
             query = state["user_query"]
 
             if not docs:
                 state["summary"] = "[No documents retrieved; cannot generate summary]"
+                decisions["summarizer"] = {
+                    "mode": "fallback",
+                    "reason": "no_documents",
+                    "provider": self.provider,
+                }
+                timestamps["summarizer"] = time.time() - start_time
                 self.logger.warning("No documents to summarize")
                 return state
 
@@ -121,16 +130,29 @@ class SummarizerAgent(BaseAgent):
 
             # Choose summarization method
             if self.use_llm and self.llm_ready:
-                summary = self._summarize_with_llm(query, docs)
+                summary = self._summarize_with_llm(state, query, docs)
             else:
                 self.logger.info("Using fallback summarization (no LLM)")
                 summary = self._summarize_fallback(query, docs)
+                decisions["summarizer"] = {
+                    "mode": "fallback",
+                    "reason": "llm_disabled_or_unavailable",
+                    "provider": self.provider,
+                }
 
             state["summary"] = summary
 
             # Log execution time
             elapsed = time.time() - start_time
-            state["metadata"]["timestamps"]["summarizer"] = elapsed
+            timestamps["summarizer"] = elapsed
+
+            decisions.setdefault(
+                "summarizer",
+                {
+                    "mode": "llm" if self.use_llm and self.llm_ready else "fallback",
+                    "provider": self.provider,
+                },
+            )
 
             self._log_step("Summary generated", {"length": len(summary.split())})
 
@@ -139,7 +161,7 @@ class SummarizerAgent(BaseAgent):
         except Exception as e:
             return self._handle_error(state, e)
 
-    def _summarize_with_llm(self, query: str, docs: list) -> str:
+    def _summarize_with_llm(self, state: WorkflowState, query: str, docs: list) -> str:
         """
         Summarize using Mistral LLM.
 
@@ -188,11 +210,27 @@ class SummarizerAgent(BaseAgent):
                 llm_elapsed,
             )
 
+            state.setdefault("metadata", {}).setdefault("decisions", {})[
+                "summarizer"
+            ] = {
+                "mode": "llm",
+                "provider": self.provider,
+                "llm_elapsed": llm_elapsed,
+            }
+
             return content.strip()
 
         except Exception as e:
             self.logger.error(f"LLM summarization failed: {e}")
-            return f"[Summarization error: {str(e)}]"
+            fallback_summary = self._summarize_fallback(query, docs)
+            state.setdefault("metadata", {}).setdefault("decisions", {})[
+                "summarizer"
+            ] = {
+                "mode": "fallback",
+                "reason": f"llm_error: {e}",
+                "provider": self.provider,
+            }
+            return fallback_summary
 
     @staticmethod
     def _extract_gemini_text(response) -> str:
