@@ -6,9 +6,9 @@ google-generativeai
 chromadb
 crewai
 litellm
-sentence-transformers
+sentence-transformers==5.4.1
+transformers<5
+sympy==1.13.3
 tqdm
 python-dotenv
 pypdf
-tensorflow
-keras

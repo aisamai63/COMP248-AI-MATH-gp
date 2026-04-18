@@ -123,6 +123,13 @@ def _extract_excerpt(
     if query_index >= 0:
         start = max(0, query_index - window // 3)
         end = min(len(cleaned_text), query_index + len(cleaned_query) + window // 2)
+
+        # Avoid chopping words at boundaries when slicing around a query match.
+        while start > 0 and cleaned_text[start - 1].isalnum():
+            start -= 1
+        while end < len(cleaned_text) and cleaned_text[end].isalnum():
+            end += 1
+
         excerpt = cleaned_text[start:end]
     else:
         query_terms = [term for term in cleaned_query.split() if len(term) > 2]

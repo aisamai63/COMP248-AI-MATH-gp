@@ -14,13 +14,22 @@ import importlib
 import logging
 import re
 import time
+import ast
 from typing import Any, Dict, List
+
+from pydantic import BaseModel
 
 from prototype.agents.base import BaseAgent
 from prototype.workflow.state import WorkflowState
 from prototype.config import llm_config, reflection_config, runtime_config
 
 logger = logging.getLogger(__name__)
+
+
+class EvaluationOutput(BaseModel):
+    factual_correctness: float
+    completeness: float
+    relevance: float
 
 
 class ReflectiveAgent(BaseAgent):
@@ -173,13 +182,59 @@ class ReflectiveAgent(BaseAgent):
             )
             raw = (response.choices[0].message.content or "").strip()
         else:
-            response = self.mistral_client.chat.complete(
+            parsed_response = self.mistral_client.chat.parse(
+                EvaluationOutput,
                 model=llm_config.MISTRAL_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return only valid JSON matching the requested schema. "
+                            "Do not include markdown, code fences, or commentary."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
                 max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
                 temperature=0.0,
             )
-            raw = response.choices[0].message.content.strip()
+            parsed = (
+                parsed_response.choices[0].message.parsed
+                if parsed_response.choices and parsed_response.choices[0].message
+                else None
+            )
+            if parsed is None:
+                raise ValueError(
+                    "Mistral parsed response did not contain structured data"
+                )
+
+            validated = self._validate_schema(parsed.model_dump())
+            confidence = self._compute_confidence(
+                factual_correctness=validated["factual_correctness"],
+                completeness=validated["completeness"],
+                relevance=validated["relevance"],
+            )
+            feedback_text = self._build_feedback_text(
+                factual_correctness=validated["factual_correctness"],
+                completeness=validated["completeness"],
+                relevance=validated["relevance"],
+            )
+
+            llm_elapsed = time.perf_counter() - llm_started
+            self.logger.info(
+                "Timing | reflector_llm_call | provider=%s | %.3fs",
+                self.provider,
+                llm_elapsed,
+            )
+
+            return {
+                "factual_correctness": validated["factual_correctness"],
+                "completeness": validated["completeness"],
+                "relevance": validated["relevance"],
+                "confidence": confidence,
+                "feedback_text": feedback_text,
+                "evaluation_source": "llm",
+            }
 
         llm_elapsed = time.perf_counter() - llm_started
         self.logger.info(
@@ -250,8 +305,7 @@ class ReflectiveAgent(BaseAgent):
             "{\n"
             '  "factual_correctness": <float 0..1>,\n'
             '  "completeness": <float 0..1>,\n'
-            '  "relevance": <float 0..1>,\n'
-            '  "feedback_text": "<short actionable feedback, max 2 sentences>"\n'
+            '  "relevance": <float 0..1>\n'
             "}\n"
             "No markdown. No explanation outside JSON.\n\n"
             f"USER_QUERY:\n{query}\n\n"
@@ -267,13 +321,26 @@ class ReflectiveAgent(BaseAgent):
         except Exception:
             pass
 
+        # Some models emit Python-style dict strings rather than strict JSON.
+        try:
+            candidate = ast.literal_eval(raw)
+            if isinstance(candidate, dict):
+                return candidate
+        except Exception:
+            pass
+
         # Try fenced code blocks first.
         code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
         for block in code_blocks:
             try:
                 return json.loads(block.strip())
             except Exception:
-                continue
+                try:
+                    candidate = ast.literal_eval(block.strip())
+                    if isinstance(candidate, dict):
+                        return candidate
+                except Exception:
+                    continue
 
         # Try embedded JSON objects (non-greedy and then greedy fallback).
         for match in re.finditer(r"\{[\s\S]*?\}", raw):
@@ -281,25 +348,30 @@ class ReflectiveAgent(BaseAgent):
             try:
                 return json.loads(candidate)
             except Exception:
-                continue
+                try:
+                    parsed = ast.literal_eval(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    continue
 
         greedy_match = re.search(r"\{[\s\S]*\}", raw)
         if greedy_match:
             try:
                 return json.loads(greedy_match.group(0).strip())
             except Exception:
-                pass
+                try:
+                    candidate = ast.literal_eval(greedy_match.group(0).strip())
+                    if isinstance(candidate, dict):
+                        return candidate
+                except Exception:
+                    pass
 
         raise ValueError("LLM evaluator did not return parseable JSON")
 
     def _validate_schema(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Validate output shape and clamp scores to [0, 1]."""
-        required = [
-            "factual_correctness",
-            "completeness",
-            "relevance",
-            "feedback_text",
-        ]
+        required = ["factual_correctness", "completeness", "relevance"]
         for key in required:
             if key not in payload:
                 raise ValueError(f"Missing field in evaluator output: {key}")
@@ -317,8 +389,66 @@ class ReflectiveAgent(BaseAgent):
             "factual_correctness": clamp(payload["factual_correctness"]),
             "completeness": clamp(payload["completeness"]),
             "relevance": clamp(payload["relevance"]),
-            "feedback_text": str(payload["feedback_text"]).strip(),
         }
+
+    def _build_feedback_text(
+        self, factual_correctness: float, completeness: float, relevance: float
+    ) -> str:
+        """Create concise feedback text from numeric reflection scores."""
+        notes = []
+        if factual_correctness < 0.8:
+            notes.append("improve factual grounding")
+        if completeness < 0.8:
+            notes.append("add missing details")
+        if relevance < 0.8:
+            notes.append("stay closer to the question")
+
+        if not notes:
+            return "Strong reflection scores. The answer is grounded, complete, and relevant."
+
+        return (
+            "Consider to "
+            + ", ".join(notes[:-1])
+            + (f", and {notes[-1]}" if len(notes) > 1 else notes[0])
+            + "."
+        )
+
+    @staticmethod
+    def _content_terms(text: str) -> set[str]:
+        """Extract simple content words for lightweight alignment checks."""
+        stopwords = {
+            "about",
+            "after",
+            "also",
+            "and",
+            "are",
+            "can",
+            "for",
+            "from",
+            "have",
+            "how",
+            "into",
+            "that",
+            "the",
+            "their",
+            "this",
+            "what",
+            "when",
+            "where",
+            "which",
+            "with",
+            "would",
+            "your",
+            "is",
+            "it",
+            "of",
+            "on",
+            "to",
+            "a",
+            "an",
+        }
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        return {token for token in tokens if len(token) > 2 and token not in stopwords}
 
     def _compute_confidence(
         self, factual_correctness: float, completeness: float, relevance: float
@@ -335,17 +465,43 @@ class ReflectiveAgent(BaseAgent):
         self, query: str, summary: str, docs: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Fail-safe minimal evaluation when LLM is unavailable."""
-        # Lightweight conservative fallback for runtime safety.
         summary_words = len(summary.split())
-        has_docs = 1.0 if docs else 0.0
-        relevance = (
-            1.0
-            if any(term in summary.lower() for term in query.lower().split()[:3])
-            else 0.5
+
+        query_terms = self._content_terms(query)
+        summary_terms = self._content_terms(summary)
+        doc_terms = self._content_terms(
+            " ".join(
+                f"{doc.get('title', '')} {doc.get('excerpt') or doc.get('text', '')}"
+                for doc in docs[:5]
+                if isinstance(doc, dict)
+            )
         )
 
-        factual_correctness = 0.55 * has_docs
-        completeness = 0.7 if summary_words >= 30 else 0.45
+        query_alignment = 0.0
+        evidence_alignment = 0.0
+        if query_terms:
+            query_alignment = len(query_terms & summary_terms) / len(query_terms)
+            evidence_alignment = len(query_terms & doc_terms) / len(query_terms)
+
+        overlap = max(query_alignment, evidence_alignment)
+
+        factual_correctness = 0.15 + 0.55 * evidence_alignment
+        completeness = 0.20 + 0.50 * overlap + min(summary_words / 120.0, 0.15)
+        relevance = 0.15 + 0.70 * query_alignment
+
+        if len(docs) > 1 and overlap < 0.5:
+            factual_correctness *= 0.75
+            completeness *= 0.75
+            relevance *= 0.75
+
+        if not summary.strip():
+            factual_correctness = 0.0
+            completeness = 0.0
+            relevance = 0.0
+
+        factual_correctness = max(0.0, min(1.0, factual_correctness))
+        completeness = max(0.0, min(1.0, completeness))
+        relevance = max(0.0, min(1.0, relevance))
         confidence = self._compute_confidence(
             factual_correctness, completeness, relevance
         )

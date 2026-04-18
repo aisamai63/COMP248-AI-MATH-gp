@@ -5,9 +5,10 @@ Centralizes all settings, constants, and environment variables.
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=True)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:

@@ -225,7 +225,11 @@ class PlannerAgent(BaseAgent):
             tok in query_lower for tok in ["matrix", "row echelon", "rref", "ref"]
         )
 
-        if query_type == "calculation" or equation_like or matrix_like:
+        if (
+            query_type == "calculation"
+            or equation_like
+            or (matrix_like and query_type != "definition")
+        ):
             tools.append("calculator")
 
         if any(keyword in query_lower for keyword in self.web_search_keywords):

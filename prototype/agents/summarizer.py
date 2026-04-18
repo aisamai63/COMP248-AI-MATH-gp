@@ -16,6 +16,7 @@ Flow:
 
 import logging
 import time
+import re
 from typing import Optional
 from prototype.agents.base import BaseAgent
 from prototype.workflow.state import WorkflowState
@@ -255,26 +256,119 @@ class SummarizerAgent(BaseAgent):
         """
         Fallback: simple summarization without LLM.
 
-        Extracts first sentence from each document and joins them.
+        Prefer the most query-relevant retrieved document instead of stitching
+        together unrelated passages.
 
         Args:
             query: User query (unused in fallback)
             docs: Retrieved documents
 
         Returns:
-            Simple concatenated summary
+            Query-focused grounded summary or a clear no-answer message
         """
-        parts = []
+        stopwords = {
+            "about",
+            "after",
+            "also",
+            "and",
+            "are",
+            "can",
+            "for",
+            "from",
+            "have",
+            "how",
+            "into",
+            "that",
+            "the",
+            "their",
+            "this",
+            "what",
+            "when",
+            "where",
+            "which",
+            "with",
+            "would",
+            "your",
+            "is",
+            "it",
+            "of",
+            "on",
+            "to",
+            "a",
+            "an",
+        }
+
+        def content_terms(text: str) -> set[str]:
+            tokens = re.findall(r"[a-z0-9]+", text.lower())
+            return {
+                token for token in tokens if len(token) > 2 and token not in stopwords
+            }
+
+        query_terms = content_terms(query)
+        best_score = -1.0
+        best_doc = None
+
         for doc in docs:
             title = doc.get("title", "Unknown")
             text = doc.get("excerpt") or doc.get("text", "")
+            if not text:
+                continue
 
-            # Get first sentence
-            first_sentence = text.split(".")[0] if text else ""
-            if first_sentence:
-                parts.append(f"**{title}**: {first_sentence.strip()}.")
+            doc_terms = content_terms(f"{title} {text}")
+            overlap = len(query_terms & doc_terms) if query_terms else 0
+            similarity = float(doc.get("similarity", 0.0) or 0.0)
+            score = (overlap * 2.0) + similarity
 
-        return " ".join(parts) if parts else "[No content available]"
+            if score > best_score:
+                best_score = score
+                best_doc = doc
+
+        if best_doc is None or best_score < 0.5:
+            return f"I could not find a direct answer in the retrieved documents for: {query}"
+
+        title = best_doc.get("title", "Unknown")
+        source_text = best_doc.get("excerpt") or best_doc.get("text", "")
+        source_text = " ".join(source_text.split())
+
+        # Pick the most query-aligned sentence for cleaner fallback output.
+        candidate_sentences = re.split(r"(?<=[.!?])\s+", source_text)
+        best_sentence = source_text
+        best_sentence_score = -1
+
+        for sentence in candidate_sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            sentence_terms = content_terms(sentence)
+            sentence_score = len(query_terms & sentence_terms)
+            if sentence_score > best_sentence_score:
+                best_sentence_score = sentence_score
+                best_sentence = sentence
+
+        lowered_sentence = best_sentence.lower()
+        earliest_term_index = None
+        for term in sorted(query_terms, key=len, reverse=True):
+            match = re.search(rf"\b{re.escape(term)}\b", lowered_sentence)
+            if not match:
+                continue
+            idx = match.start()
+            if earliest_term_index is None or idx < earliest_term_index:
+                earliest_term_index = idx
+
+        # Trim noisy leading fragment from OCR/chunk boundaries when a query term appears early.
+        if earliest_term_index is not None and 0 < earliest_term_index <= 40:
+            best_sentence = best_sentence[earliest_term_index:]
+
+        best_sentence = best_sentence.strip(" ,;:-")
+        if best_sentence and best_sentence[0].islower():
+            best_sentence = best_sentence[0].upper() + best_sentence[1:]
+        if best_sentence and best_sentence[-1] not in ".!?":
+            best_sentence += "."
+
+        if len(best_sentence) > 320:
+            best_sentence = best_sentence[:320].rsplit(" ", 1)[0] + "..."
+
+        return f"Definition from {title}: {best_sentence}"
 
     def _build_summary_prompt(self, query: str, docs: list) -> str:
         """

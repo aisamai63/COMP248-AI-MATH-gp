@@ -201,9 +201,11 @@ def get_embedding_model(model_name: str = rag_config.EMBEDDING_MODEL):
         model = SentenceTransformer(model_name)
         logger.info(f"✓ Embedding model loaded: {model_name}")
         return model
-    except ImportError:
+    except ImportError as e:
         logger.error(
-            "✗ sentence-transformers not installed. Run: pip install sentence-transformers"
+            "✗ Failed to import sentence-transformers dependencies: %s. "
+            "Try reinstalling from prototype/requirements.txt.",
+            e,
         )
         raise
     except Exception as e:

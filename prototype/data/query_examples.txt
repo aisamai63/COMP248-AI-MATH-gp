@@ -1,0 +1,16 @@
+Example queries based on the loaded data and retrieved PDF topics:
+
+1. What is the quadratic formula?
+2. How do I solve ax^2 + bx + c = 0?
+3. What does the discriminant b^2 - 4ac tell me?
+4. When does a quadratic equation have two real solutions?
+5. What is the Pythagorean theorem?
+6. How do I find the hypotenuse of a right triangle?
+7. If the legs of a right triangle are 3 and 4, what is the hypotenuse?
+8. How can I tell whether a triangle is a right triangle?
+9. What is a matrix?
+10. What are the entries of a matrix?
+11. What is a symmetric matrix?
+12. How do matrix operations work?
+13. What is the norm of a vector in R3?
+14. How do I calculate the length of a vector using the Pythagorean theorem?
