@@ -299,6 +299,17 @@ def main():
         initial_sidebar_state="collapsed",
     )
 
+    # Pre-warm embedding model at startup to avoid first-query latency
+    try:
+        from prototype.chroma_setup import get_embedding_model
+
+        get_embedding_model()
+        logger.info("Embedding model pre-warm complete")
+    except Exception:
+        logger.warning(
+            "Embedding pre-warm failed; continuing without pre-warm", exc_info=True
+        )
+
     _init_session_state()
     _inject_css(bool(st.session_state.messages))
     loading_mount = st.empty()

@@ -218,11 +218,18 @@ class KBClient:
 
     def _query_chromadb(self, query: str, k: int) -> List[Dict]:
         started = time.perf_counter()
+
+        # Measure model load time (lazy-loaded embedding model)
+        model_load_started = time.perf_counter()
         model = self._get_embedding_model()
+        model_load_elapsed = time.perf_counter() - model_load_started
+
+        # Embed query and measure encode time
         embed_started = time.perf_counter()
         query_embedding = model.encode([query])[0].tolist()
         embed_elapsed = time.perf_counter() - embed_started
 
+        # Query ChromaDB and measure remote/local query time
         query_started = time.perf_counter()
         results = self.collection.query(
             query_embeddings=[query_embedding],
@@ -236,6 +243,8 @@ class KBClient:
         metadatas = results.get("metadatas", [[]])[0] if results else []
         distances = results.get("distances", [[]])[0] if results else []
 
+        # Post-processing (building document dicts + excerpt extraction)
+        postproc_started = time.perf_counter()
         for i, doc_text in enumerate(docs):
             metadata = metadatas[i] if i < len(metadatas) else {}
             distance = distances[i] if i < len(distances) else 1.0
@@ -253,11 +262,14 @@ class KBClient:
             }
             documents.append(prepared)
 
+        postproc_elapsed = time.perf_counter() - postproc_started
         total_elapsed = time.perf_counter() - started
         logging.info(
-            "Timing | chromadb | embed=%.3fs query=%.3fs total=%.3fs docs=%d",
+            "Timing | chromadb | model_load=%.3fs embed=%.3fs query=%.3fs postproc=%.3fs total=%.3fs docs=%d",
+            model_load_elapsed,
             embed_elapsed,
             query_elapsed,
+            postproc_elapsed,
             total_elapsed,
             len(documents),
         )

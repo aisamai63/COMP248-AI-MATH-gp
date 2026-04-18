@@ -17,6 +17,8 @@ Usage:
 
 import logging
 import shutil
+import os
+import glob
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,6 +34,9 @@ CHROMA_DB_DIR = db_config.CHROMA_DB_DIR
 
 # Ensure directory exists
 Path(CHROMA_DB_DIR).mkdir(parents=True, exist_ok=True)
+
+# Module-level cache for the embedding model to avoid repeated downloads/loads
+_EMBEDDING_MODEL = None
 
 
 def _is_fatal_base_exception(exc: BaseException) -> bool:
@@ -65,11 +70,6 @@ def get_chroma_client(
 
     Returns:
         ChromaDB client with persistent storage
-
-    Note:
-        - Uses PersistentClient (new Chroma API)
-        - Data is stored in .chroma_db/ and persists across sessions
-        - First call initializes; subsequent calls reuse existing DB
     """
     if persist_directory is None:
         persist_directory = CHROMA_DB_DIR
@@ -99,7 +99,6 @@ def get_chroma_client(
     except BaseException as e:
         if _is_fatal_base_exception(e):
             raise
-        # pyo3_runtime.PanicException may derive from BaseException, not Exception.
         logger.error(f"✗ Failed to initialize ChromaDB client: {e}")
 
         try:
@@ -150,20 +149,8 @@ def get_chroma_collection(
 ) -> chromadb.Collection:
     """
     Get or create a ChromaDB collection for math documents.
-
-    Args:
-        client: ChromaDB client instance
-        collection_name: Name of collection (e.g., "math_docs")
-        distance_metric: Similarity metric: "cosine", "l2", or "ip"
-
-    Returns:
-        chromadb.Collection ready for adding/querying documents
-
-    Raises:
-        Exception: If collection creation fails
     """
     try:
-        # Get or create collection with metadata
         collection = client.get_or_create_collection(
             name=collection_name,
             metadata={
@@ -171,7 +158,6 @@ def get_chroma_collection(
                 "embedding_model": rag_config.EMBEDDING_MODEL,
                 "distance_metric": distance_metric,
             },
-            # Note: distance_metric is handled at query time in ChromaDB
         )
         logger.info(f"✓ Collection '{collection_name}' ready")
         return collection
@@ -183,24 +169,125 @@ def get_chroma_collection(
 
 def get_embedding_model(model_name: str = rag_config.EMBEDDING_MODEL):
     """
-    Load SentenceTransformer embedding model.
-
-    Args:
-        model_name: HuggingFace model name
-                   Default: "all-MiniLM-L6-v2" (384 dims, fast)
-                   Alternatives:
-                     - "all-mpnet-base-v2" (768 dims, better quality)
-                     - "paraphrase-MiniLM-L6-v2" (384 dims, specializ. paraphrase)
-
-    Returns:
-        SentenceTransformer model instance (cached for efficiency)
+    Load SentenceTransformer embedding model with preference for local cache.
     """
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is not None:
+        return _EMBEDDING_MODEL
+
     try:
         from sentence_transformers import SentenceTransformer
 
-        model = SentenceTransformer(model_name)
+        # Prefer a locally cached model directory if provided via environment.
+        model_dir = os.environ.get("MODEL_CACHE_DIR")
+        hf_home = os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+
+        # Log the environment context so we can diagnose remote HEAD retries.
+        logger.info(
+            "Embedding model load context: MODEL_CACHE_DIR=%s HF_HOME=%s model_name=%s",
+            model_dir,
+            hf_home,
+            model_name,
+        )
+
+        candidates = []
+        if model_dir:
+            candidates.append(model_dir)
+        if hf_home:
+            candidates.append(os.path.join(hf_home, model_name))
+            owner_repo = model_name.replace("/", "--")
+            pattern = os.path.join(hf_home, f"models--{owner_repo}*")
+            matches = glob.glob(pattern)
+            candidates.extend(sorted(matches))
+
+        # Also probe some common local cache locations (useful on Windows/USB drives)
+        home = Path.home()
+        common_paths = [
+            os.path.join("A:", "hf_cache", model_name),
+            os.path.join(
+                str(home),
+                ".cache",
+                "huggingface",
+                "hub",
+                "models--" + model_name.replace("/", "--"),
+            ),
+            os.path.join(str(home), ".cache", "huggingface", "hub", model_name),
+        ]
+        for p in common_paths:
+            candidates.append(p)
+
+        # Expand and search for likely candidate directories
+        expanded = []
+        for cand in candidates:
+            if not cand:
+                continue
+            p = Path(cand)
+            if p.exists():
+                expanded.append(str(p))
+            else:
+                glob_pattern = str(p) + "*"
+                matches = glob.glob(glob_pattern)
+                expanded.extend(matches)
+
+        if hf_home:
+            token = model_name.split("/")[-1]
+            for match in glob.glob(
+                os.path.join(hf_home, "**", f"*{token}*"), recursive=True
+            ):
+                expanded.append(match)
+
+        # Deduplicate
+        seen = set()
+        candidates_to_try = []
+        for c in expanded:
+            if c and c not in seen:
+                seen.add(c)
+                candidates_to_try.append(c)
+
+        logger.debug("Embedding model candidate paths: %s", candidates_to_try)
+
+        for cand in candidates_to_try:
+            try:
+                cand_path = Path(cand)
+                if not cand_path.exists() or not cand_path.is_dir():
+                    continue
+                # Check for common model files
+                has_model_file = any(
+                    (cand_path / fname).exists()
+                    for fname in (
+                        "model.safetensors",
+                        "pytorch_model.bin",
+                        "tf_model.h5",
+                    )
+                )
+                if not has_model_file:
+                    for sub in cand_path.iterdir():
+                        if sub.is_dir() and any(
+                            (sub / fname).exists()
+                            for fname in (
+                                "model.safetensors",
+                                "pytorch_model.bin",
+                                "tf_model.h5",
+                            )
+                        ):
+                            cand_path = sub
+                            has_model_file = True
+                            break
+                if not has_model_file:
+                    continue
+
+                _EMBEDDING_MODEL = SentenceTransformer(str(cand_path))
+                logger.info("✓ Embedding model loaded from local cache: %s", cand_path)
+                return _EMBEDDING_MODEL
+            except Exception:
+                logger.debug(
+                    "Failed to load embedding from candidate: %s", cand, exc_info=True
+                )
+
+        # Fallback: load by model name (may download from Hugging Face)
+        _EMBEDDING_MODEL = SentenceTransformer(model_name)
         logger.info(f"✓ Embedding model loaded: {model_name}")
-        return model
+        return _EMBEDDING_MODEL
     except ImportError as e:
         logger.error(
             "✗ Failed to import sentence-transformers dependencies: %s. "
@@ -216,12 +303,6 @@ def get_embedding_model(model_name: str = rag_config.EMBEDDING_MODEL):
 def check_collection_status(collection: chromadb.Collection) -> dict:
     """
     Check collection status: number of documents, metadata, etc.
-
-    Args:
-        collection: ChromaDB collection instance
-
-    Returns:
-        Status dictionary with document count and metadata
     """
     try:
         count = collection.count()

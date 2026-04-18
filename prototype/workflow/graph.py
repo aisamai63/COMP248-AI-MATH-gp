@@ -135,7 +135,27 @@ class MathInquiriesGraph:
             updated = retriever.run(state)
             elapsed = time.perf_counter() - started
             logger.info("Timing | retriever | %.3fs", elapsed)
+            # record total retriever node time
             updated["metadata"]["timestamps"]["retriever_total"] = elapsed
+
+            # If the retriever or KB client populated more detailed timestamps,
+            # log them as a concise breakdown for easier profiling.
+            ts = updated.get("metadata", {}).get("timestamps", {})
+            if ts:
+                try:
+                    # Format available timestamp keys (skip non-numeric)
+                    items = [
+                        f"{k}={float(v):.3f}s"
+                        for k, v in ts.items()
+                        if isinstance(v, (int, float))
+                    ]
+                    if items:
+                        logger.info(
+                            "Timing | retriever_breakdown | %s", " ".join(items)
+                        )
+                except Exception:
+                    # Fallback: dump raw timestamps dict
+                    logger.info("Timing | retriever_timestamps_raw | %s", ts)
             docs = updated.get("retrieved_docs", [])
             _record_node_metadata(
                 updated,
