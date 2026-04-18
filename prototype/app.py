@@ -263,19 +263,20 @@ def _warmup_rag(graph) -> None:
     retriever = graph.retriever
     _ = retriever.kb_client
 
-    # Preload the embedding model as well.
+    # Preload the embedding model and fallback docs.
     from prototype.chroma_setup import get_embedding_model
+    from prototype.db import load_fallback_docs_cached
 
     get_embedding_model()
+    load_fallback_docs_cached()
     logger.info("RAG preload complete")
   except Exception as exc:
     logger.warning(
-        "RAG preload failed; it will be initialized lazily on first query",
-        exc_info=True,
+      "RAG preload failed; it will be initialized lazily on first query",
+      exc_info=True,
     )
 
 
-# ---------------- MAIN ---------------- #
 def main():
   st.set_page_config(
       page_title="Math Inquiries",
@@ -296,19 +297,30 @@ def main():
     )
 
   graph = None
-  try:
-    graph = initialize_graph()
-    _warmup_rag(graph)
-  except Exception:
-    logger.warning(
-        "Graph preloading failed; it will be retried on first query",
-        exc_info=True,
-    )
 
   _init_session_state()
   _inject_css(bool(st.session_state.messages))
   loading_mount = st.empty()
 
+  st.session_state.setdefault("warmup_complete", False)
+  startup_mount = st.empty()
+
+  if not st.session_state.warmup_complete:
+    try:
+      with startup_mount.container():
+        with st.spinner("Warming up RAG resources..."):
+          graph = initialize_graph()
+          _warmup_rag(graph)
+      st.session_state.warmup_complete = True
+    except Exception:
+      logger.warning(
+        "Graph preloading failed; it will be retried on first query",
+        exc_info=True,
+      )
+    finally:
+      startup_mount.empty()
+  else:
+    graph = initialize_graph()
   submitted = False
   query = ""
 
