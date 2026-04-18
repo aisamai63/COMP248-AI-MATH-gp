@@ -42,31 +42,30 @@ def _inject_css(has_messages: bool) -> None:
         """
         <style>
         :root {
-            --bg-main: #343541;
-            --bg-assistant: #444654;
-            --bg-panel: #3b3d4e;
-            --text-main: #ececf1;
-            --text-muted: #acacbe;
-            --border: #565869;
-            --accent: #8ab4ff;
+            --bg-main: #212121;
+            --bg-user: #10a37f;
+            --bg-assistant: #353740;
+            --text-main: #f4f4f7;
+            --text-muted: #a9adbd;
+            --border: #2d2f36;
         }
 
         .stApp {
-            background-color: var(--bg-main);
+            background: var(--bg-main);
             color: var(--text-main);
         }
 
         #MainMenu, footer, header {
-            visibility: hidden;
+            display: none;
         }
 
         .block-container {
-            max-width: 850px;
+            max-width: 600px;
+            margin: 0 auto;
             padding-top: 2rem;
-            padding-bottom: 8.5rem;
+            padding-bottom: 7rem;
         }
 
-        /* Center first screen */
         .center-screen {
             display: flex;
             flex-direction: column;
@@ -77,7 +76,7 @@ def _inject_css(has_messages: bool) -> None:
 
         .welcome-title {
             text-align: center;
-            font-size: 2.2rem;
+            font-size: 2rem;
             font-weight: 600;
         }
 
@@ -87,45 +86,10 @@ def _inject_css(has_messages: bool) -> None:
             margin-bottom: 2rem;
         }
 
-        .loading-anchor {
-            min-height: 2.2rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 0.35rem 0 0.8rem 0;
-        }
-
-        .diag-card {
-            background: var(--bg-panel);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 0.8rem;
-            margin-bottom: 1rem;
-        }
-
-        .diag-title {
-            font-size: 0.82rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: var(--text-muted);
-            margin-bottom: 0.55rem;
-        }
-
-        .diag-card .stMetric {
-            background: #323443;
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 0.35rem 0.55rem;
-        }
-
-        .diag-card .stExpander {
-            margin-top: 0.65rem;
-        }
-
         .chat-container {
             display: flex;
             flex-direction: column;
-            gap: 1.2rem;
+            gap: 1.1rem;
         }
 
         .chat-row {
@@ -141,53 +105,55 @@ def _inject_css(has_messages: bool) -> None:
         }
 
         .chat-bubble {
-            max-width: 75%;
-            padding: 0.9rem 1.1rem;
-            border-radius: 14px;
+            max-width: 80%;
+            padding: 0.85rem 1.1rem;
+            border-radius: 12px;
             line-height: 1.6;
+            font-size: 1.05rem;
+            margin-bottom: 2px;
         }
 
         .chat-bubble.user {
-            background: var(--bg-assistant);
+            background: var(--bg-user);
+            color: #fff;
         }
 
         .chat-bubble.assistant {
-            background: transparent;
-            border: 1px solid var(--border);
+            background: var(--bg-assistant);
+            color: var(--text-main);
         }
 
-        /* Keep chat input visible and centered while scrolling */
         div[data-testid="stChatInput"] {
             position: fixed;
             left: 50%;
             transform: translateX(-50%);
-            bottom: 0.95rem;
-            width: min(850px, calc(100% - 2rem));
+            bottom: 1.2rem;
+            width: min(600px, 98vw);
             z-index: 1000;
-            background: transparent;
-        }
-
-        div[data-testid="stChatInput"] > div {
-            background: #40414f;
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+            background: var(--bg-main);
+            border-radius: 16px;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.10);
         }
 
         div[data-testid="stChatInput"] input {
-            background: transparent !important;
-            border: none !important;
+            background: #232428 !important;
             color: var(--text-main) !important;
+            border: none !important;
+            border-radius: 12px !important;
+            padding: 1rem 1.2rem !important;
+            font-size: 1.08rem !important;
         }
 
         div[data-testid="stChatInput"] button {
-            background: white !important;
-            color: black !important;
-            border-radius: 8px !important;
+            background: var(--bg-user) !important;
+            color: #fff !important;
+            border-radius: 10px !important;
+            font-weight: 600 !important;
+            font-size: 1.05rem !important;
         }
 
         .stExpander {
-            background: #2f303a !important;
+            background: #232428 !important;
             border: 1px solid var(--border) !important;
         }
         </style>

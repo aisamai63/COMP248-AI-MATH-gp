@@ -1,3 +1,7 @@
+def _escape_message(content: str) -> str:
+    return html.escape(content).replace("\n", "<br>")
+
+
 """Streamlit chat UI helpers for the Math Inquiries frontend.
 
 This module contains only presentation logic: CSS, layout, message rendering,
@@ -19,43 +23,32 @@ def apply_chat_css() -> None:
         """
         <style>
             :root {
-                --bg-main: #0f1117;
-                --bg-panel: #171923;
-                --bg-card: #1f2430;
-                --bg-card-2: #262b38;
-                --border-subtle: rgba(255, 255, 255, 0.08);
+                --bg-main: #212121;
+                --bg-user: #10a37f;
+                --bg-assistant: #353740;
                 --text-main: #f4f4f7;
                 --text-muted: #a9adbd;
-                --accent: #10a37f;
-                --accent-soft: rgba(16, 163, 127, 0.15);
+                --border: #2d2f36;
             }
 
             .stApp {
-                background:
-                    radial-gradient(circle at top, rgba(16, 163, 127, 0.10), transparent 36%),
-                    linear-gradient(180deg, #0c0e14 0%, #0f1117 100%);
+                background: var(--bg-main);
                 color: var(--text-main);
             }
 
-            /* Remove Streamlit chrome for a clean app shell. */
-            #MainMenu,
-            footer,
-            header {
-                visibility: hidden;
+            #MainMenu, footer, header {
+                display: none;
             }
 
-            [data-testid="stHeader"] {
-                height: 0;
-            }
-
-            [data-testid="stSidebar"], [data-testid="collapsedControl"] {
+            [data-testid="stHeader"], [data-testid="stSidebar"], [data-testid="collapsedControl"] {
                 display: none;
             }
 
             .block-container {
-                max-width: 1120px;
-                padding-top: 1.25rem;
-                padding-bottom: 1.5rem;
+                max-width: 600px;
+                margin: 0 auto;
+                padding-top: 2rem;
+                padding-bottom: 7rem;
             }
 
             .chat-shell {
@@ -68,21 +61,20 @@ def apply_chat_css() -> None:
             .chat-hero {
                 margin: 1.25rem auto 0.5rem auto;
                 text-align: center;
-                max-width: 760px;
+                max-width: 600px;
             }
 
             .chat-hero h1 {
                 margin: 0;
-                font-size: clamp(2rem, 3vw, 3.1rem);
-                line-height: 1.05;
-                letter-spacing: -0.04em;
-                font-weight: 750;
+                font-size: 2rem;
+                line-height: 1.1;
+                font-weight: 700;
             }
 
             .chat-hero p {
                 margin: 0.55rem 0 0 0;
                 color: var(--text-muted);
-                font-size: 0.98rem;
+                font-size: 1rem;
             }
 
             .top-spacer {
@@ -91,53 +83,111 @@ def apply_chat_css() -> None:
 
             .intro-card {
                 width: 100%;
-                max-width: 760px;
+                max-width: 600px;
                 margin: 0 auto 1rem auto;
                 padding: 1rem 1.15rem;
-                border-radius: 20px;
-                background: rgba(31, 36, 48, 0.65);
-                border: 1px solid var(--border-subtle);
-                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.26);
+                border-radius: 14px;
+                background: var(--bg-assistant);
+                border: 1px solid var(--border);
                 color: var(--text-main);
             }
 
             .intro-card .muted {
                 color: var(--text-muted);
                 margin-top: 0.35rem;
-                font-size: 0.94rem;
+                font-size: 0.98rem;
             }
 
-            /* Center the composer block and give it a floating feel. */
+            /* Chat bubbles and spacing */
+            .history-wrap, .chat-container {
+                background: rgba(53, 55, 64, 0.12);
+                border-radius: 18px;
+                box-shadow: 0 2px 16px rgba(0,0,0,0.10);
+                padding: 1.2rem 0.5rem 1.2rem 0.5rem;
+                margin-bottom: 1.5rem;
+            }
+
+            .chat-row {
+                display: flex;
+                margin-bottom: 1.2rem;
+            }
+
+            .chat-row.user {
+                justify-content: flex-end;
+            }
+
+            .chat-row.assistant {
+                justify-content: flex-start;
+            }
+
+            .chat-bubble {
+                max-width: 80%;
+                padding: 1.1rem 1.3rem;
+                border-radius: 18px;
+                line-height: 1.6;
+                font-size: 1.08rem;
+                margin-bottom: 2px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.10);
+                transition: box-shadow 0.2s;
+            }
+
+            .chat-bubble.user {
+                background: var(--bg-user);
+                color: #fff;
+                border-bottom-right-radius: 6px;
+                border-top-right-radius: 18px;
+                border-top-left-radius: 18px;
+                border-bottom-left-radius: 18px;
+                box-shadow: 0 2px 8px rgba(16,163,127,0.10);
+            }
+
+            .chat-bubble.assistant {
+                background: var(--bg-assistant);
+                color: var(--text-main);
+                border-bottom-left-radius: 6px;
+                border-top-right-radius: 18px;
+                border-top-left-radius: 18px;
+                border-bottom-right-radius: 18px;
+                box-shadow: 0 2px 8px rgba(53,55,64,0.10);
+            }
+
+            .chat-bubble:hover {
+                box-shadow: 0 4px 16px rgba(16,163,127,0.13);
+            }
+
+            /* Input and send button */
             div[data-testid="stForm"] {
                 width: 100%;
-                max-width: 760px;
+                max-width: 600px;
                 margin: 0 auto;
                 padding: 0;
             }
 
             div[data-testid="stForm"] > form {
-                background: rgba(31, 36, 48, 0.86);
-                border: 1px solid var(--border-subtle);
-                border-radius: 28px;
-                padding: 0.95rem 0.95rem 0.9rem 0.95rem;
-                box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
-                transition: box-shadow 180ms ease, border-color 180ms ease, transform 180ms ease;
+                background: var(--bg-assistant);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 0.7rem 0.7rem 0.7rem 1rem;
+                box-shadow: 0 2px 16px rgba(0,0,0,0.10);
+                display: flex;
+                align-items: center;
             }
 
             div[data-testid="stForm"] > form:hover {
-                border-color: rgba(16, 163, 127, 0.38);
-                box-shadow: 0 0 0 1px rgba(16, 163, 127, 0.18), 0 22px 54px rgba(0, 0, 0, 0.42);
+                border-color: var(--bg-user);
+                box-shadow: 0 0 0 2px var(--bg-user), 0 2px 16px rgba(0,0,0,0.12);
                 transform: translateY(-1px);
             }
 
-            /* Keep the text entry dark, rounded, and left-aligned. */
             div[data-testid="stTextInput"] input {
-                background: var(--bg-card) !important;
+                background: #232428 !important;
                 color: var(--text-main) !important;
-                border: 1px solid rgba(255, 255, 255, 0.08) !important;
-                border-radius: 999px !important;
-                padding: 0.9rem 1.05rem !important;
-                box-shadow: inset 0 0 0 1px transparent;
+                border: none !important;
+                border-radius: 12px !important;
+                padding: 1rem 1.2rem !important;
+                font-size: 1.08rem !important;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+                margin-right: 0.7rem;
             }
 
             div[data-testid="stTextInput"] input::placeholder {
@@ -145,64 +195,32 @@ def apply_chat_css() -> None:
             }
 
             div[data-testid="stTextInput"] input:focus {
-                border-color: rgba(16, 163, 127, 0.7) !important;
-                box-shadow: 0 0 0 3px rgba(16, 163, 127, 0.14) !important;
+                border-color: var(--bg-user) !important;
+                box-shadow: 0 0 0 2px var(--bg-user) !important;
             }
 
-            /* Make the submit button subtle and chat-like. */
             .stButton > button,
             div[data-testid="stFormSubmitButton"] button {
-                background: linear-gradient(180deg, #10a37f 0%, #0f8f6f 100%) !important;
-                color: #ffffff !important;
+                background: var(--bg-user) !important;
+                color: #fff !important;
                 border: none !important;
-                border-radius: 999px !important;
-                padding: 0.85rem 1rem !important;
+                border-radius: 10px !important;
+                padding: 0.85rem 1.2rem !important;
                 font-weight: 700 !important;
-                transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
+                font-size: 1.08rem !important;
+                box-shadow: 0 2px 8px rgba(16,163,127,0.10);
+                transition: box-shadow 0.2s, filter 0.2s;
             }
 
             .stButton > button:hover,
             div[data-testid="stFormSubmitButton"] button:hover {
-                filter: brightness(1.06);
-                box-shadow: 0 0 0 3px rgba(16, 163, 127, 0.14);
+                filter: brightness(1.08);
+                box-shadow: 0 0 0 2px var(--bg-user), 0 4px 16px rgba(16,163,127,0.13);
                 transform: translateY(-1px);
             }
 
-            /* Tabs and panels kept darker and minimal. */
-            .stTabs [data-baseweb="tab-list"] {
-                gap: 1rem;
-                border-bottom: 1px solid var(--border-subtle);
-            }
-
-            .stTabs [data-baseweb="tab"] {
-                color: var(--text-muted);
-                padding-left: 0;
-                padding-right: 0;
-            }
-
-            .stTabs [aria-selected="true"] {
-                color: var(--text-main) !important;
-            }
-
-            .stExpander {
-                background: rgba(31, 36, 48, 0.72);
-                border: 1px solid var(--border-subtle);
-                border-radius: 16px;
-            }
-
-            .stMetric {
-                background: rgba(31, 36, 48, 0.72);
-                padding: 0.75rem 1rem;
-                border-radius: 16px;
-                border: 1px solid var(--border-subtle);
-            }
-
-            .stAlert {
-                border-radius: 14px;
-            }
-
             .results-panel {
-                max-width: 760px;
+                max-width: 600px;
                 margin: 1rem auto 0 auto;
             }
 
@@ -215,64 +233,20 @@ def apply_chat_css() -> None:
 
             @media (max-width: 768px) {
                 .block-container {
-                    padding-left: 0.85rem;
-                    padding-right: 0.85rem;
+                    padding-left: 0.5rem;
+                    padding-right: 0.5rem;
                 }
-
                 .chat-hero {
                     margin-top: 0.75rem;
                 }
-
                 div[data-testid="stForm"] > form {
-                    border-radius: 22px;
+                    border-radius: 12px;
                 }
             }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-
-def render_hero() -> None:
-    """Render the centered title block."""
-    st.markdown(
-        """
-        <div class="chat-hero">
-            <h1>Math Inquiries</h1>
-            <p>Planner → Retriever → Summarizer → Reflector → ToolAgent</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_top_spacer(has_history: bool) -> None:
-    """Add vertical breathing room so the composer feels centered when chat is empty."""
-    spacer_height = "3vh" if has_history else "16vh"
-    st.markdown(
-        f'<div class="top-spacer" style="height:{spacer_height};"></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_intro_if_empty(has_history: bool) -> None:
-    """Show a small intro card only before the first message."""
-    if has_history:
-        return
-
-    st.markdown(
-        """
-        <div class="intro-card">
-            <strong>Ask anything about math.</strong>
-            <div class="muted">The input stays centered, the chat history grows above it, and the workflow runs in the background.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _escape_message(content: str) -> str:
-    return html.escape(content).replace("\n", "<br>")
 
 
 def _build_history_html(messages: List[Dict[str, str]]) -> str:
