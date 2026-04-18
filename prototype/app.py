@@ -1,8 +1,6 @@
 """Streamlit frontend for the Math Inquiries LangGraph workflow."""
 
 from __future__ import annotations
-from prototype.workflow import create_runtime_graph
-import streamlit as st
 
 import logging
 import pathlib
@@ -10,10 +8,13 @@ import sys
 import html
 from typing import Dict, Any
 
-# Allow running from repo root
+# Allow running from repo root (MUST come before prototype imports)
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
   sys.path.insert(0, str(ROOT))
+
+import streamlit as st
+from prototype.workflow import create_runtime_graph
 
 
 logging.basicConfig(level=logging.INFO)
