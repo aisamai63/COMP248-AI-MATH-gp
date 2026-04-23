@@ -3,6 +3,7 @@ langchain
 langgraph
 openai
 google-generativeai
+mistralai
 chromadb
 crewai
 litellm

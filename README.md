@@ -94,8 +94,8 @@ cd COMP248-AI-MATH-gp
 ### Windows (PowerShell)
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 ### macOS/Linux
@@ -119,8 +119,13 @@ Create `prototype/.env` from `prototype/.env.example` and set required keys.
 Minimum recommended values:
 
 ```env
-MISTRAL_API_KEY=your_key_here
-MISTRAL_MODEL=mistral-small-latest
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-4o-mini
+
+# Optional alternatives
+MISTRAL_API_KEY=
+GEMINI_API_KEY=
 
 # Optional tool integrations
 SERPAPI_KEY=
@@ -147,8 +152,14 @@ python ingest.py
 
 ### Streamlit App
 
-```bash
-streamlit run prototype/app.py
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run prototype/app.py
+```
+
+If you see `ModuleNotFoundError` (for example `No module named 'langgraph'`), reinstall dependencies in the same interpreter used to run Streamlit:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r prototype/requirements.txt
 ```
 
 ### CLI Runner
@@ -312,7 +323,7 @@ def register_default_tools(registry) -> None:
 
 ## Notes
 
-- If `MISTRAL_API_KEY` is missing, some LLM-backed features may fall back to conservative logic.
+- If the active provider key (`OPENAI_API_KEY`, `MISTRAL_API_KEY`, or `GEMINI_API_KEY`) is missing, LLM-backed features fall back to conservative logic.
 - If `SERPAPI_KEY` is missing, web search falls back to DuckDuckGo where applicable.
 - Tune `CONFIDENCE_THRESHOLD` and `MAX_ITERATIONS` to balance quality vs latency.
 

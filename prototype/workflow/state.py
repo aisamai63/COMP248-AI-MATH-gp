@@ -97,6 +97,7 @@ def initialize_state(user_query: str) -> WorkflowState:
             "agent_sequence": [],  # Record which agents ran
             "timestamps": {},  # When each agent ran
             "decisions": {},  # Why agent made decision
+            "llm_calls": [],  # Per-agent LLM call diagnostics
         },
     )
 

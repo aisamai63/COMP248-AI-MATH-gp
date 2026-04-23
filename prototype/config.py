@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=True)
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"), override=False)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -41,7 +41,7 @@ class LLMConfig:
     """LLM (Language Model) configuration."""
 
     # Provider selection: mistral | openai | gemini
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mistral").strip().lower()
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai").strip().lower()
 
     # Mistral settings
     MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
@@ -56,6 +56,12 @@ class LLMConfig:
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
     MISTRAL_TEMPERATURE: float = 0.2  # Lower = more deterministic
+    # Production default: keep UI responsive; fall back if model is too slow.
+    LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
+    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "2"))
+    LLM_RETRY_BACKOFF_SECONDS: float = float(
+        os.getenv("LLM_RETRY_BACKOFF_SECONDS", "1.0")
+    )
     # Balanced mode defaults: faster responses with acceptable quality.
     MISTRAL_MAX_TOKENS_DEFAULT: int = int(os.getenv("MISTRAL_MAX_TOKENS_DEFAULT", "90"))
     MISTRAL_MAX_TOKENS_REFLECTION: int = int(
@@ -124,6 +130,10 @@ class DatabaseConfig:
     BASE_DIR: str = os.path.dirname(__file__)
     CHROMA_DB_DIR: str = os.getenv(
         "CHROMA_DB_DIR", os.path.join(os.path.dirname(__file__), ".chroma_db")
+    )
+    CHROMADB_RUNTIME_FALLBACK_DIR: str = os.getenv(
+        "CHROMADB_RUNTIME_FALLBACK_DIR",
+        os.path.join(str(Path.home()), ".comp248_chroma_db_runtime"),
     )
     CHROMADB_COLLECTION_NAME: str = os.getenv("CHROMADB_COLLECTION_NAME", "math_docs")
     CHROMADB_DISTANCE_METRIC: str = os.getenv("CHROMADB_DISTANCE_METRIC", "cosine")

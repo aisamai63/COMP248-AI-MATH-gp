@@ -12,6 +12,8 @@ __pycache__/
 
 # Local database and generated runtime artifacts
 prototype/.chroma_db/
+prototype/.chroma_db_runtime/
+prototype/.chroma_db_corrupt_*/
 
 # Streamlit local cache/state
 .streamlit/secrets.toml

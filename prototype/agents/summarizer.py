@@ -19,6 +19,7 @@ import time
 import re
 from typing import Optional
 from prototype.agents.base import BaseAgent
+from prototype.llm_gateway import get_llm_gateway
 from prototype.workflow.state import WorkflowState
 from prototype.config import llm_config, runtime_config
 
@@ -45,55 +46,14 @@ class SummarizerAgent(BaseAgent):
         super().__init__()
         # FAST_MODE prioritizes latency over generation quality.
         self.use_llm = use_llm and (not runtime_config.FAST_MODE)
-        self.llm_ready = False
+        self.gateway = get_llm_gateway() if self.use_llm else None
         self.provider = llm_config.LLM_PROVIDER
-        self.mistral_client = None
-        self.openai_client = None
-        self.gemini_model = None
-
-        if self.use_llm:
-            self._initialize_llm_client()
-        elif runtime_config.FAST_MODE:
+        self.init_error: Optional[str] = None
+        self.llm_ready = bool(self.gateway and self.gateway.ready)
+        if self.use_llm and self.gateway and not self.gateway.ready:
+            self.init_error = self.gateway.init_error or "LLM gateway init failed"
+        if runtime_config.FAST_MODE:
             self.logger.info("FAST_MODE enabled: summarizer LLM disabled")
-
-    def _initialize_llm_client(self) -> None:
-        """Initialize LLM client based on configured provider."""
-        try:
-            if self.provider == "gemini":
-                if not llm_config.GEMINI_API_KEY:
-                    self.logger.warning("GEMINI_API_KEY missing; using fallback.")
-                    return
-                import google.generativeai as genai
-
-                genai.configure(api_key=llm_config.GEMINI_API_KEY)
-                self.gemini_model = genai.GenerativeModel(llm_config.GEMINI_MODEL)
-                self.llm_ready = True
-                self.logger.info("Gemini client initialized successfully")
-                return
-
-            if self.provider == "openai":
-                if not llm_config.OPENAI_API_KEY:
-                    self.logger.warning("OPENAI_API_KEY missing; using fallback.")
-                    return
-                from openai import OpenAI
-
-                self.openai_client = OpenAI(api_key=llm_config.OPENAI_API_KEY)
-                self.llm_ready = True
-                self.logger.info("OpenAI client initialized successfully")
-                return
-
-            # Default to Mistral for backward compatibility.
-            if not llm_config.MISTRAL_API_KEY:
-                self.logger.warning("MISTRAL_API_KEY missing; using fallback.")
-                return
-            from mistralai.client import Mistral
-
-            self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
-            self.llm_ready = True
-            self.logger.info("Mistral client initialized successfully")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize {self.provider} client: {e}")
-            self.llm_ready = False
 
     def run(self, state: WorkflowState) -> WorkflowState:
         """
@@ -135,9 +95,12 @@ class SummarizerAgent(BaseAgent):
             else:
                 self.logger.info("Using fallback summarization (no LLM)")
                 summary = self._summarize_fallback(query, docs)
+                fallback_reason = "llm_disabled_or_unavailable"
+                if self.use_llm and not self.llm_ready and self.init_error:
+                    fallback_reason = f"llm_init_error: {self.init_error}"
                 decisions["summarizer"] = {
                     "mode": "fallback",
-                    "reason": "llm_disabled_or_unavailable",
+                    "reason": fallback_reason,
                     "provider": self.provider,
                 }
 
@@ -174,52 +137,40 @@ class SummarizerAgent(BaseAgent):
             LLM-generated summary
         """
         try:
-            prompt = self._build_summary_prompt(query, docs)
+            if self.gateway is None:
+                raise RuntimeError("LLM gateway not configured")
 
-            llm_started = time.perf_counter()
-
-            if self.provider == "gemini" and self.gemini_model is not None:
-                response = self.gemini_model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": llm_config.MISTRAL_TEMPERATURE,
-                        "max_output_tokens": llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
-                    },
-                )
-                content = self._extract_gemini_text(response)
-            elif self.provider == "openai" and self.openai_client is not None:
-                response = self.openai_client.chat.completions.create(
-                    model=llm_config.OPENAI_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
-                    temperature=llm_config.MISTRAL_TEMPERATURE,
-                )
-                content = response.choices[0].message.content or ""
-            else:
-                response = self.mistral_client.chat.complete(
-                    model=llm_config.MISTRAL_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=llm_config.MISTRAL_MAX_TOKENS_DEFAULT,
-                    temperature=llm_config.MISTRAL_TEMPERATURE,
-                )
-                content = response.choices[0].message.content
-
-            llm_elapsed = time.perf_counter() - llm_started
-            self.logger.info(
-                "Timing | summarizer_llm_call | provider=%s | %.3fs",
-                self.provider,
-                llm_elapsed,
+            prompt = self._build_summary_prompt(state, query, docs)
+            planner_decision = (
+                state.get("metadata", {}).get("decisions", {}).get("planner", {}) or {}
             )
+            query_type = str(planner_decision.get("query_type", "") or "").strip().lower()
 
+            max_tokens = int(llm_config.MISTRAL_MAX_TOKENS_DEFAULT)
+            # Avoid truncation for typical classroom explanations.
+            if query_type in {"definition", "concept", "research"}:
+                max_tokens = max(max_tokens, 160)
+            elif query_type in {"calculation", "proof"}:
+                max_tokens = max(max_tokens, 240)
+
+            content = self.gateway.complete_text(
+                state,
+                agent=self.name,
+                purpose="summarize",
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=llm_config.MISTRAL_TEMPERATURE,
+            )
             state.setdefault("metadata", {}).setdefault("decisions", {})[
                 "summarizer"
             ] = {
                 "mode": "llm",
-                "provider": self.provider,
-                "llm_elapsed": llm_elapsed,
+                "provider": self.gateway.provider,
+                "model": self.gateway.model_name,
+                "query_type": query_type,
+                "max_tokens": max_tokens,
             }
-
-            return content.strip()
+            return self._clean_answer((content or "").strip(), query_type=query_type)
 
         except Exception as e:
             self.logger.error(f"LLM summarization failed: {e}")
@@ -234,23 +185,51 @@ class SummarizerAgent(BaseAgent):
             return fallback_summary
 
     @staticmethod
-    def _extract_gemini_text(response) -> str:
-        """Extract text robustly from Gemini SDK response."""
-        text = getattr(response, "text", None)
-        if text:
-            return text
+    def _clean_answer(text: str, *, query_type: str) -> str:
+        """Light post-processing to keep answers unified, friendly, and readable."""
+        if not text:
+            return ""
 
-        candidates = getattr(response, "candidates", None) or []
-        parts = []
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            if content is None:
+        # Normalize whitespace.
+        text = text.replace("\r\n", "\n")
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+        def canon(s: str) -> str:
+            s = s.strip().lower()
+            s = re.sub(r"\\\(|\\\)", "", s)
+            s = re.sub(r"[^a-z0-9]+", "", s)
+            return s
+
+        # Remove duplicated consecutive sentences (common when models repeat themselves).
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        cleaned = []
+        last = None
+        for part in parts:
+            part = part.strip()
+            if not part:
                 continue
-            for part in getattr(content, "parts", []) or []:
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    parts.append(part_text)
-        return "\n".join(parts).strip()
+            c = canon(part)
+            if last is not None and c and c == last:
+                continue
+            cleaned.append(part)
+            last = c
+        text = " ".join(cleaned).strip()
+
+        # If the response ends mid-sentence, trim to last sentence boundary.
+        if text and text[-1] not in ".!?":
+            last_end = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+            if last_end > 60:
+                text = text[: last_end + 1].strip()
+
+        # Keep definition answers compact.
+        if query_type in {"definition", "concept"}:
+            text = re.sub(r"\s+", " ", text).strip()
+            sentences = re.split(r"(?<=[.!?])\s+", text)
+            if len(sentences) > 5:
+                text = " ".join(sentences[:5]).strip()
+
+        return text
 
     def _summarize_fallback(self, query: str, docs: list) -> str:
         """
@@ -370,7 +349,7 @@ class SummarizerAgent(BaseAgent):
 
         return f"Definition from {title}: {best_sentence}"
 
-    def _build_summary_prompt(self, query: str, docs: list) -> str:
+    def _build_summary_prompt(self, state: WorkflowState, query: str, docs: list) -> str:
         """
         Build prompt for LLM summarization.
 
@@ -386,26 +365,72 @@ class SummarizerAgent(BaseAgent):
         Returns:
             Formatted prompt for LLM
         """
-        prompt = (
-            "You are an expert research assistant. Answer the user's question using ONLY "
-            "the provided document excerpts. Do not use external knowledge.\n\n"
-            f"USER QUESTION: {query}\n\n"
-            "RESPONSE STYLE:\n"
-            "- Start with a short direct answer in plain language.\n"
-            "- Add 2-4 bullet points only if they help clarity.\n"
-            "- Avoid numbered section headers unless explicitly requested.\n"
-            "- Keep it concise and classroom-friendly.\n\n"
-            "DOCUMENTS:\n"
+        planner_decision = (
+            state.get("metadata", {}).get("decisions", {}).get("planner", {}) or {}
+        )
+        query_type = str(planner_decision.get("query_type", "") or "").strip().lower()
+
+        tool_calc = (
+            state.get("metadata", {})
+            .get("decisions", {})
+            .get("pre_tools", {})
+            .get("calculator_result")
+        )
+        tool_block = ""
+        if tool_calc and isinstance(tool_calc, str) and tool_calc.strip():
+            tool_block = (
+                "\nTOOL RESULT (authoritative):\n"
+                f"{tool_calc.strip()}\n"
+                "Use this as the final numeric/symbolic result. Your job is to explain it clearly.\n\n"
+            )
+
+        mode_hint = "research"
+        if query_type in {"definition", "concept"}:
+            mode_hint = "definition"
+        elif query_type in {"calculation", "solve", "proof"}:
+            mode_hint = "calculation"
+
+        format_rules = (
+            "FORMATTING RULES (use Markdown + LaTeX when helpful):\n"
+            "- Always include **Final Answer**.\n"
+            "- Include **Formula/Setup** ONLY if the question asks for a formula or the answer truly depends on one.\n"
+            "- Include **Step-by-step** ONLY for calculations/derivations (or if the user asks for steps).\n"
+            "- For a purely conceptual/definition question, answer in 2-5 sentences and DO NOT force a formula section.\n"
+            "- Use $$...$$ for displayed equations; for matrices use $$\\\\begin{bmatrix} ... \\\\end{bmatrix}$$.\n"
+            "- IMPORTANT: Any LaTeX command (like \\\\times, \\\\sqrt, subscripts) MUST be inside $...$ or $$...$$.\n"
+            "- Do not repeat sentences or restate the same definition twice.\n"
+            "- Do not invent facts not present in the excerpts.\n"
         )
 
+        section_template = (
+            "Use ONLY the sections that are relevant (omit irrelevant ones):\n"
+            "- **Concept**\n"
+            "- **Formula/Setup**\n"
+            "- **Step-by-step**\n"
+            "- **Final Answer**\n"
+            "- **Optional Check**\n"
+        )
+
+        prompt = (
+            "You are an expert mathematics professor.\n"
+            "Answer the user's question using ONLY the provided document excerpts.\n"
+            "If the excerpts do not contain enough information, say so explicitly and state what is missing.\n\n"
+            f"MODE_HINT: {mode_hint}\n\n"
+            + format_rules
+            + "\n"
+            + section_template
+            + "\nUSER QUESTION:\n{query}\n\n"
+            + tool_block
+            + "DOCUMENT EXCERPTS:\n{documents}\n"
+        )
+
+        docs_block = ""
         for i, doc in enumerate(docs, 1):
             excerpt = doc.get("excerpt") or doc.get("text", "")
             title = doc.get("title", "Document")
             source = doc.get("source", "unknown")
-            prompt += f"\n[Document {i}] {title} (source: {source})\n{excerpt}\n"
+            docs_block += f"\n[Document {i}] {title} (source: {source})\n{excerpt}\n"
 
-        prompt += (
-            "\nPlease answer based only on the above documents. "
-            "If the user has a typo, briefly interpret it and answer the intended question."
-        )
-        return prompt
+        # Avoid LangChain templating here because literal `{}` in LaTeX (e.g.
+        # \begin{bmatrix}) can be interpreted as template variables.
+        return prompt.replace("{query}", query).replace("{documents}", docs_block)

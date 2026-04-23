@@ -1,5 +1,6 @@
 """Built-in tool functions: Sympy calculator and web search."""
 
+import ast
 import json
 import importlib
 import re
@@ -58,6 +59,29 @@ def _format_matrix_block(matrix) -> str:
     return "\n".join(rows)
 
 
+def _format_sympy_latex(expr) -> str:
+    """Best-effort LaTeX formatting for Sympy objects."""
+    try:
+        import sympy
+
+        latex_str = sympy.latex(expr)
+        # Sympy matrices default to \\left[\\begin{matrix} ... \\end{matrix}\\right]
+        # which renders fine, but bmatrix tends to look nicer in math UIs.
+        if "\\begin{matrix}" in latex_str:
+            latex_str = latex_str.replace("\\left[\\begin{matrix}", "\\begin{bmatrix}")
+            latex_str = latex_str.replace("\\end{matrix}\\right]", "\\end{bmatrix}")
+        return latex_str
+    except Exception:
+        return ""
+
+
+def _wrap_math_block(latex_str: str) -> str:
+    latex_str = (latex_str or "").strip()
+    if not latex_str:
+        return ""
+    return f"$$\n{latex_str}\n$$"
+
+
 def _sanitize_equation_side(side: str) -> str:
     """Keep only the leading math-like segment of one equation side."""
     allowed_funcs = {"sqrt", "sin", "cos", "tan", "log", "ln", "exp"}
@@ -113,6 +137,9 @@ def _normalize_math_text(text: str) -> str:
     )
 
     out = out.replace("^", "**")
+    # Merge variable subscripts that often appear spaced when copied from PDFs:
+    # "x 1" -> "x1", "a 12" -> "a12".
+    out = re.sub(r"\b([a-zA-Z])\s+(\d+)\b", r"\1\2", out)
     out = re.sub(r"\s+", " ", out).strip()
     return out
 
@@ -178,6 +205,59 @@ def sympy_calculator_tool(query: str) -> str:
         transformations = standard_transformations + (
             implicit_multiplication_application,
         )
+
+        def _extract_balanced_matrix_literals(text: str, limit: int = 2) -> list[str]:
+            """Extract up to `limit` balanced `[[...]]` literals from text."""
+            literals: list[str] = []
+            i = 0
+            n = len(text)
+            while i < n and len(literals) < limit:
+                start = text.find("[[", i)
+                if start == -1:
+                    break
+                depth = 0
+                j = start
+                while j < n:
+                    if text[j] == "[":
+                        depth += 1
+                    elif text[j] == "]":
+                        depth -= 1
+                        if depth == 0:
+                            literals.append(text[start : j + 1])
+                            i = j + 1
+                            break
+                    j += 1
+                else:
+                    break
+            return literals
+
+        # Matrix operations: handle common "A=[[...]] and B=[[...]]" inputs.
+        # This bypasses parse_expr quirks on nested list literals.
+        if "[[" in q and "]]" in q:
+            try:
+                mats = _extract_balanced_matrix_literals(q, limit=2)
+                matrices = [sympy.Matrix(ast.literal_eval(m)) for m in mats]
+                if matrices:
+                    a = matrices[0]
+                    b = matrices[1] if len(matrices) > 1 else None
+
+                    if ("inverse" in q or " inv" in q) and b is None:
+                        inv_a = a.inv()
+                        latex = _wrap_math_block(_format_sympy_latex(inv_a))
+                        return "Inverse:\n" + str(inv_a) + ("\n\n" + latex if latex else "")
+
+                    if "det" in q or "determinant" in q:
+                        det_a = a.det()
+                        latex = _wrap_math_block(_format_sympy_latex(det_a))
+                        return f"Determinant: {det_a}" + ("\n\n" + latex if latex else "")
+
+                    if b is not None and any(tok in q for tok in ["*", " x ", "×", "multiply"]):
+                        prod = a * b
+                        latex = _wrap_math_block(_format_sympy_latex(prod))
+                        return "Product A·B:\n" + str(prod) + ("\n\n" + latex if latex else "")
+            except Exception:
+                # Fall through to generic parsing.
+                pass
 
         # Basic cleanup for natural language prefixes.
         for prefix in [
@@ -259,6 +339,19 @@ def sympy_calculator_tool(query: str) -> str:
                     else:
                         lines.extend(["", f"Solutions: {solutions}"])
 
+                    # Add LaTeX blocks to improve visual rendering (Streamlit will render $$...$$).
+                    latex_chunks = []
+                    for title, mat in [
+                        ("Augmented matrix [A|b]", aug_matrix),
+                        ("Row echelon form (REF)", ref_matrix),
+                        ("Reduced row echelon form (RREF)", rref_matrix),
+                    ]:
+                        latex = _format_sympy_latex(mat)
+                        if latex:
+                            latex_chunks.append(f"{title}:\n{_wrap_math_block(latex)}")
+                    if latex_chunks:
+                        lines.extend(["", "LaTeX view:", *latex_chunks])
+
                     return "\n".join(lines)
                 except Exception:
                     # Fall back to generic equation solving path if not linear.
@@ -276,7 +369,16 @@ def sympy_calculator_tool(query: str) -> str:
                     for sym in symbols
                     if sym in solution
                 ]
-                return "Solution: " + ", ".join(parts)
+                eqs = []
+                for sym in symbols:
+                    if sym not in solution:
+                        continue
+                    rhs = sympy.simplify(solution[sym])
+                    eqs.append(sympy.Eq(sym, rhs))
+                latex_lines = [sympy.latex(e) for e in eqs] if eqs else []
+                latex_block = _wrap_math_block("\\\\\n".join(latex_lines)) if latex_lines else ""
+                pretty = "Solution: " + ", ".join(parts)
+                return pretty + ("\n\n" + latex_block if latex_block else "")
 
             return f"Solutions: {solutions}"
 
@@ -285,7 +387,10 @@ def sympy_calculator_tool(query: str) -> str:
 
         expression = parse_expr(q, transformations=transformations, evaluate=True)
         simplified = sympy.simplify(expression)
-        return f"Result: {simplified}"
+        latex = _format_sympy_latex(simplified)
+        latex_block = _wrap_math_block(latex) if latex else ""
+        pretty = f"Result: {simplified}"
+        return pretty + ("\n\n" + latex_block if latex_block else "")
     except Exception as exc:
         return f"Calculator failed: {exc}"
 

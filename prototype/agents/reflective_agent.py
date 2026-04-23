@@ -9,27 +9,17 @@ Evaluates summary quality using prompt-based LLM scoring across:
 Returns structured JSON-compatible metrics for planner loop integration.
 """
 
-import json
-import importlib
 import logging
 import re
 import time
-import ast
 from typing import Any, Dict, List
 
-from pydantic import BaseModel
-
 from prototype.agents.base import BaseAgent
+from prototype.llm_gateway import get_llm_gateway
 from prototype.workflow.state import WorkflowState
 from prototype.config import llm_config, reflection_config, runtime_config
 
 logger = logging.getLogger(__name__)
-
-
-class EvaluationOutput(BaseModel):
-    factual_correctness: float
-    completeness: float
-    relevance: float
 
 
 class ReflectiveAgent(BaseAgent):
@@ -40,59 +30,14 @@ class ReflectiveAgent(BaseAgent):
     def __init__(self, use_llm: bool = True):
         super().__init__()
         self.use_llm = use_llm and (not runtime_config.FAST_MODE)
-        self.llm_ready = False
+        self.gateway = get_llm_gateway() if self.use_llm else None
+        self.llm_ready = bool(self.gateway and self.gateway.ready)
         self.provider = llm_config.LLM_PROVIDER
-        self.mistral_client = None
-        self.openai_client = None
-        self.gemini_model = None
-
-        if self.use_llm:
-            self._initialize_llm_client()
-        elif runtime_config.FAST_MODE:
+        self.init_error: str = ""
+        if self.use_llm and self.gateway and not self.gateway.ready:
+            self.init_error = self.gateway.init_error or "LLM gateway init failed"
+        if runtime_config.FAST_MODE:
             self.logger.info("FAST_MODE enabled: reflector LLM disabled")
-
-    def _initialize_llm_client(self) -> None:
-        """Initialize LLM client based on configured provider."""
-        try:
-            if self.provider == "gemini":
-                if not llm_config.GEMINI_API_KEY:
-                    self.logger.warning(
-                        "GEMINI_API_KEY missing; reflector uses fallback."
-                    )
-                    return
-                genai = importlib.import_module("google.generativeai")
-
-                genai.configure(api_key=llm_config.GEMINI_API_KEY)
-                self.gemini_model = genai.GenerativeModel(llm_config.GEMINI_MODEL)
-                self.llm_ready = True
-                self.logger.info("LLM reflection enabled (Gemini)")
-                return
-
-            if self.provider == "openai":
-                if not llm_config.OPENAI_API_KEY:
-                    self.logger.warning(
-                        "OPENAI_API_KEY missing; reflector uses fallback."
-                    )
-                    return
-                openai_module = importlib.import_module("openai")
-                OpenAI = getattr(openai_module, "OpenAI")
-
-                self.openai_client = OpenAI(api_key=llm_config.OPENAI_API_KEY)
-                self.llm_ready = True
-                self.logger.info("LLM reflection enabled (OpenAI)")
-                return
-
-            if not llm_config.MISTRAL_API_KEY:
-                self.logger.warning("MISTRAL_API_KEY missing; reflector uses fallback.")
-                return
-            from mistralai.client import Mistral
-
-            self.mistral_client = Mistral(api_key=llm_config.MISTRAL_API_KEY)
-            self.llm_ready = True
-            self.logger.info("LLM reflection enabled (Mistral)")
-        except Exception as exc:
-            self.logger.warning(f"Failed to init {self.provider} for reflection: {exc}")
-            self.llm_ready = False
 
     def run(self, state: WorkflowState) -> WorkflowState:
         """Evaluate current summary and update reflection_metrics in state."""
@@ -115,7 +60,7 @@ class ReflectiveAgent(BaseAgent):
             if self.llm_ready:
                 try:
                     metrics = self._evaluate_with_llm(
-                        query=query, summary=summary, docs=docs
+                        state=state, query=query, summary=summary, docs=docs
                     )
                 except Exception as exc:
                     self.logger.warning(
@@ -125,15 +70,54 @@ class ReflectiveAgent(BaseAgent):
                     metrics = self._fallback_evaluation(
                         query=query, summary=summary, docs=docs
                     )
-                    metrics["evaluation_source"] = "fallback_llm_parse_error"
+                    metrics["evaluation_source"] = "fallback_llm_error"
+                    metrics["llm_error_type"] = type(exc).__name__
+                    metrics["llm_error"] = str(exc)
             else:
                 metrics = self._fallback_evaluation(
                     query=query, summary=summary, docs=docs
                 )
+                if self.init_error:
+                    metrics["evaluation_source"] = "fallback_init_error"
+                    metrics["feedback_text"] = (
+                        f"LLM evaluator unavailable ({self.init_error}); used fallback scoring."
+                    )
 
             # Planner loop integration: single confidence and retry signal.
-            confidence = float(metrics.get("confidence", 0.0))
-            should_retry = confidence < reflection_config.CONFIDENCE_THRESHOLD
+            confidence_raw = float(metrics.get("confidence", 0.0))
+            doc_count = len(docs) if isinstance(docs, list) else 0
+            similarities = []
+            if isinstance(docs, list):
+                for doc in docs[:5]:
+                    if not isinstance(doc, dict):
+                        continue
+                    sim = doc.get("similarity", None)
+                    try:
+                        if sim is not None:
+                            similarities.append(float(sim))
+                    except Exception:
+                        continue
+            avg_similarity = sum(similarities) / len(similarities) if similarities else 0.0
+            doc_count_factor = min(1.0, doc_count / 5.0) if doc_count else 0.0
+            retrieval_quality = max(
+                0.0, min(1.0, 0.5 * doc_count_factor + 0.5 * max(0.0, min(1.0, avg_similarity)))
+            )
+            # Confidence should reflect both evaluation scores and evidence quality.
+            confidence = max(0.0, min(1.0, confidence_raw * (0.7 + 0.3 * retrieval_quality)))
+            metrics["confidence_raw"] = confidence_raw
+            metrics["confidence"] = confidence
+            metrics["retrieval_quality"] = retrieval_quality
+            metrics["avg_similarity_top5"] = avg_similarity
+            metrics["doc_count"] = doc_count
+            evaluation_source = str(metrics.get("evaluation_source", "") or "")
+            iteration = int(state.get("iteration_count", 0) or 0)
+            should_retry = (
+                confidence < reflection_config.CONFIDENCE_THRESHOLD
+                and iteration < int(reflection_config.MAX_ITERATIONS)
+            )
+            # Reliability: if reflection is not actually LLM-based, do not loop.
+            if evaluation_source != "llm":
+                should_retry = False
             metrics["should_retry"] = should_retry
 
             # Compatibility with existing UI code that expects notes list.
@@ -158,96 +142,42 @@ class ReflectiveAgent(BaseAgent):
             return self._handle_error(state, exc)
 
     def _evaluate_with_llm(
-        self, query: str, summary: str, docs: List[Dict[str, Any]]
+        self, state: WorkflowState, query: str, summary: str, docs: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Prompt-based evaluation with strict JSON output contract."""
+        if self.gateway is None:
+            raise RuntimeError("LLM gateway not configured")
+
         prompt = self._build_evaluation_prompt(query=query, summary=summary, docs=docs)
-
-        llm_started = time.perf_counter()
-        if self.provider == "gemini" and self.gemini_model is not None:
-            response = self.gemini_model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.0,
-                    "max_output_tokens": llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
-                },
-            )
-            raw = self._extract_gemini_text(response).strip()
-        elif self.provider == "openai" and self.openai_client is not None:
-            response = self.openai_client.chat.completions.create(
-                model=llm_config.OPENAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
-                temperature=0.0,
-            )
-            raw = (response.choices[0].message.content or "").strip()
-        else:
-            parsed_response = self.mistral_client.chat.parse(
-                EvaluationOutput,
-                model=llm_config.MISTRAL_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Return only valid JSON matching the requested schema. "
-                            "Do not include markdown, code fences, or commentary."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
-                temperature=0.0,
-            )
-            parsed = (
-                parsed_response.choices[0].message.parsed
-                if parsed_response.choices and parsed_response.choices[0].message
-                else None
-            )
-            if parsed is None:
-                raise ValueError(
-                    "Mistral parsed response did not contain structured data"
-                )
-
-            validated = self._validate_schema(parsed.model_dump())
-            confidence = self._compute_confidence(
-                factual_correctness=validated["factual_correctness"],
-                completeness=validated["completeness"],
-                relevance=validated["relevance"],
-            )
-            feedback_text = self._build_feedback_text(
-                factual_correctness=validated["factual_correctness"],
-                completeness=validated["completeness"],
-                relevance=validated["relevance"],
-            )
-
-            llm_elapsed = time.perf_counter() - llm_started
-            self.logger.info(
-                "Timing | reflector_llm_call | provider=%s | %.3fs",
-                self.provider,
-                llm_elapsed,
-            )
-
-            return {
-                "factual_correctness": validated["factual_correctness"],
-                "completeness": validated["completeness"],
-                "relevance": validated["relevance"],
-                "confidence": confidence,
-                "feedback_text": feedback_text,
-                "evaluation_source": "llm",
-            }
-
-        llm_elapsed = time.perf_counter() - llm_started
-        self.logger.info(
-            "Timing | reflector_llm_call | provider=%s | %.3fs",
-            self.provider,
-            llm_elapsed,
+        schema_hint = (
+            "{\n"
+            '  "factual_correctness": <float 0..1>,\n'
+            '  "completeness": <float 0..1>,\n'
+            '  "relevance": <float 0..1>\n'
+            "}"
         )
-
-        parsed = self._extract_json(raw)
+        system = (
+            "Return only valid JSON matching the requested schema. "
+            "Do not include markdown, code fences, or commentary."
+        )
+        parsed, meta = self.gateway.complete_json(
+            state,
+            agent=self.name,
+            purpose="reflect",
+            prompt=prompt,
+            max_tokens=llm_config.MISTRAL_MAX_TOKENS_REFLECTION,
+            temperature=0.0,
+            schema_hint=schema_hint,
+            system=system,
+        )
         validated = self._validate_schema(parsed)
 
-        # Weighted score for easy planner integration.
         confidence = self._compute_confidence(
+            factual_correctness=validated["factual_correctness"],
+            completeness=validated["completeness"],
+            relevance=validated["relevance"],
+        )
+        feedback_text = self._build_feedback_text(
             factual_correctness=validated["factual_correctness"],
             completeness=validated["completeness"],
             relevance=validated["relevance"],
@@ -258,28 +188,13 @@ class ReflectiveAgent(BaseAgent):
             "completeness": validated["completeness"],
             "relevance": validated["relevance"],
             "confidence": confidence,
-            "feedback_text": validated["feedback_text"],
+            "feedback_text": feedback_text,
             "evaluation_source": "llm",
+            "parse_ok": bool(meta.get("parse_ok")),
+            "repaired": bool(meta.get("repaired")),
+            "model": self.gateway.model_name,
+            "provider": self.gateway.provider,
         }
-
-    @staticmethod
-    def _extract_gemini_text(response) -> str:
-        """Extract text robustly from Gemini SDK response."""
-        text = getattr(response, "text", None)
-        if text:
-            return text
-
-        candidates = getattr(response, "candidates", None) or []
-        parts = []
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            if content is None:
-                continue
-            for part in getattr(content, "parts", []) or []:
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    parts.append(part_text)
-        return "\n".join(parts)
 
     def _build_evaluation_prompt(
         self, query: str, summary: str, docs: List[Dict[str, Any]]
@@ -295,6 +210,8 @@ class ReflectiveAgent(BaseAgent):
             "\n\n".join(context_blocks) if context_blocks else "[No documents provided]"
         )
 
+        # Avoid LangChain templating here because literal JSON braces `{}` can be
+        # misinterpreted as template variables. Build the final prompt string directly.
         return (
             "You are a strict evaluator for RAG responses. Evaluate ONLY using the provided documents.\n"
             "Task: score the candidate summary on three axes from 0.0 to 1.0:\n"
@@ -303,86 +220,55 @@ class ReflectiveAgent(BaseAgent):
             "3) relevance: answer stays focused on the query\n\n"
             "Return ONLY valid JSON with this exact schema:\n"
             "{\n"
-            '  "factual_correctness": <float 0..1>,\n'
-            '  "completeness": <float 0..1>,\n'
-            '  "relevance": <float 0..1>\n'
+            '  \"factual_correctness\": <float 0..1>,\n'
+            '  \"completeness\": <float 0..1>,\n'
+            '  \"relevance\": <float 0..1>\n'
             "}\n"
-            "No markdown. No explanation outside JSON.\n\n"
+            "No markdown. No explanation outside JSON.\n"
+            "DO NOT OMIT ANY FIELD. If unsure, set the value to 0.0. Always include all three fields.\n"
+            "If you cannot score, set all values to 0.0.\n\n"
             f"USER_QUERY:\n{query}\n\n"
             f"CANDIDATE_SUMMARY:\n{summary}\n\n"
             f"SOURCE_DOCUMENTS:\n{docs_text}"
         )
 
-    def _extract_json(self, raw: str) -> Dict[str, Any]:
-        """Extract JSON safely from model output, including fenced responses."""
-        # Try direct parse first.
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-
-        # Some models emit Python-style dict strings rather than strict JSON.
-        try:
-            candidate = ast.literal_eval(raw)
-            if isinstance(candidate, dict):
-                return candidate
-        except Exception:
-            pass
-
-        # Try fenced code blocks first.
-        code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        for block in code_blocks:
-            try:
-                return json.loads(block.strip())
-            except Exception:
-                try:
-                    candidate = ast.literal_eval(block.strip())
-                    if isinstance(candidate, dict):
-                        return candidate
-                except Exception:
-                    continue
-
-        # Try embedded JSON objects (non-greedy and then greedy fallback).
-        for match in re.finditer(r"\{[\s\S]*?\}", raw):
-            candidate = match.group(0).strip()
-            try:
-                return json.loads(candidate)
-            except Exception:
-                try:
-                    parsed = ast.literal_eval(candidate)
-                    if isinstance(parsed, dict):
-                        return parsed
-                except Exception:
-                    continue
-
-        greedy_match = re.search(r"\{[\s\S]*\}", raw)
-        if greedy_match:
-            try:
-                return json.loads(greedy_match.group(0).strip())
-            except Exception:
-                try:
-                    candidate = ast.literal_eval(greedy_match.group(0).strip())
-                    if isinstance(candidate, dict):
-                        return candidate
-                except Exception:
-                    pass
-
-        raise ValueError("LLM evaluator did not return parseable JSON")
-
     def _validate_schema(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate output shape and clamp scores to [0, 1]."""
+        """Validate output shape and clamp scores to [0, 1]. Fill missing fields with 0.0 and log a warning."""
         required = ["factual_correctness", "completeness", "relevance"]
+
+        # Normalize common variants from different model styles.
+        if payload and any(k not in payload for k in required):
+            normalized = {}
+
+            def norm_key(name: str) -> str:
+                return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+            for k, v in payload.items():
+                normalized[norm_key(k)] = v
+
+            for key in required:
+                if key in payload:
+                    continue
+                alias = norm_key(key)
+                if alias in normalized:
+                    payload[key] = normalized[alias]
+
+        # Fill missing fields with 0.0 and log a warning
         for key in required:
             if key not in payload:
-                raise ValueError(f"Missing field in evaluator output: {key}")
+                logger.warning(
+                    f"LLM evaluator output missing field '{key}'. Setting to 0.0. Full output: {payload}"
+                )
+                payload[key] = 0.0
 
         def clamp(value: Any) -> float:
             try:
                 num = float(value)
             except Exception as exc:
-                raise ValueError(
-                    f"Non-numeric score in evaluator output: {value}"
-                ) from exc
+                logger.warning(
+                    f"Non-numeric score in evaluator output: {value}. Setting to 0.0. Full output: {payload}"
+                )
+                num = 0.0
             return max(0.0, min(1.0, num))
 
         return {

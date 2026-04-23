@@ -13,44 +13,57 @@ class ToolAgent(BaseAgent):
 
     name = "ToolAgent"
 
-    def __init__(self, registry: ToolRegistry = None):
+    def __init__(
+        self,
+        registry: ToolRegistry = None,
+        *,
+        allowed_tools: List[str] | None = None,
+        decision_key: str = "tool_agent",
+        expose_results: bool = True,
+    ):
         super().__init__()
         self.registry = registry or ToolRegistry()
         if not self.registry.list_tools():
             register_default_tools(self.registry)
+        self.allowed_tools = allowed_tools
+        self.decision_key = decision_key
+        self.expose_results = expose_results
 
     def run(self, state: WorkflowState) -> WorkflowState:
         start_time = time.time()
         try:
             query = state.get("user_query", "")
             selected_tools = self._select_tools(state, query)
+            if self.allowed_tools is not None:
+                selected_tools = [t for t in selected_tools if t in set(self.allowed_tools)]
 
             if not selected_tools:
                 self._log_step("No tools selected", {"query": query})
-                state["tool_results"] = None
+                if self.expose_results:
+                    state["tool_results"] = None
+                outputs = []
             else:
                 self._log_step("Selected tools", {"tools": selected_tools})
                 outputs = self.registry.execute_many(selected_tools, query)
-                state["tool_results"] = self._format_tool_results(outputs)
+                if self.expose_results:
+                    state["tool_results"] = self._format_tool_results(outputs)
 
-                # If calculator succeeded, use it as authoritative answer.
-                for item in outputs:
-                    if item.get("tool") != "calculator":
-                        continue
-                    result_text = str(item.get("result", ""))
-                    if result_text.startswith("Calculator failed"):
-                        continue
-                    if result_text.strip():
-                        state["summary"] = result_text
-                        # Avoid duplicate noisy tool panel for successful calculator outputs.
-                        state["tool_results"] = None
-                    break
+            calculator_result = None
+            for item in outputs:
+                if item.get("tool") != "calculator":
+                    continue
+                result_text = str(item.get("result", "") or "")
+                if result_text.strip() and not result_text.startswith("Calculator failed"):
+                    calculator_result = result_text.strip()
+                break
 
             elapsed = time.time() - start_time
-            state["metadata"]["timestamps"]["tool_agent"] = elapsed
-            state["metadata"]["decisions"]["tool_agent"] = {
+            state["metadata"]["timestamps"][self.decision_key] = elapsed
+            state["metadata"]["decisions"][self.decision_key] = {
                 "selected_tools": selected_tools,
                 "available_tools": self.registry.list_tools(),
+                "outputs": outputs,
+                "calculator_result": calculator_result,
             }
             return state
         except Exception as exc:

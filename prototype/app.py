@@ -3,12 +3,109 @@
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
 import sys
-import html
 from typing import Dict, Any
 
 import streamlit as st
+import re
+
+
+def render_math_or_text(text):
+    """Render LaTeX blocks with st.latex and fallback to markdown for plain text."""
+    if not text:
+        return
+
+    # Normalize common LaTeX delimiters into forms Streamlit handles well.
+    # - Convert \[...\] blocks into $$...$$ blocks.
+    # - Convert \( ... \) inline into $...$ inline.
+    text = re.sub(r"\\\[\s*([\s\S]*?)\s*\\\]", r"$$\1$$", text)
+    text = re.sub(r"\\\(\s*([\s\S]*?)\s*\\\)", r"$\1$", text)
+
+    # If the model outputs LaTeX commands inside normal parentheses, wrap as inline math.
+    # Example: "( m \\times n )" -> "$m \\times n$"
+    def _wrap_paren_latex(match: re.Match) -> str:
+        inner = match.group(1) or ""
+        inner = inner.strip()
+        return f"${inner}$" if inner else match.group(0)
+
+    text = re.sub(r"\(\s*([^)]*\\[a-zA-Z]+[^)]*)\s*\)", _wrap_paren_latex, text)
+
+    # Render $$...$$ blocks as LaTeX
+    latex_blocks = re.findall(r"\$\$(.*?)\$\$", text, re.DOTALL)
+    for block in latex_blocks:
+        st.latex(block)
+    # Remove rendered blocks from text
+    text = re.sub(r"\$\$(.*?)\$\$", "", text, flags=re.DOTALL)
+    # Render remaining text (may include inline $...$)
+    if text.strip():
+        st.markdown(text)
+
+
+def _extract_chat_answer(summary: str) -> str:
+    """
+    Make the chat bubble show just the answer, not section labels like "Final Answer".
+
+    Diagnostics still show the full structured summary.
+    """
+    if not summary:
+        return ""
+
+    text = summary.replace("\r\n", "\n").strip()
+
+    # If the model produced a "Final Answer" section, extract its body until the next section.
+    section_header = re.compile(
+        r"(?im)^\s*(?:\d+\.\s*)?(?:\*\*)?\s*(concept|formula/setup|step-by-step|final answer|optional check)\s*(?:\*\*)?\s*:?\s*$"
+    )
+    final_inline = re.compile(
+        r"(?im)^\s*(?:\d+\.\s*)?(?:\*\*)?\s*final answer\s*(?:\*\*)?\s*:?\s*(.+?)\s*$"
+    )
+
+    m = final_inline.search(text)
+    if m:
+        start = m.start(0)
+        # slice from the matched line to search for next header after it
+        rest = text[start:]
+        # current line content after "Final Answer"
+        first_line = m.group(1).strip()
+        # remaining after the line
+        after_line = rest.split("\n", 1)[1] if "\n" in rest else ""
+
+        collected = [first_line] if first_line else []
+        if after_line.strip():
+            # Stop at the next known header (Concept/Formula/...).
+            lines = after_line.split("\n")
+            for line in lines:
+                if section_header.match(line):
+                    break
+                collected.append(line)
+        return "\n".join([l for l in collected if l is not None]).strip()
+
+    # No inline final answer; try to extract a block starting at a "Final Answer" header line.
+    lines = text.split("\n")
+    out_lines: list[str] = []
+    in_final = False
+    for line in lines:
+        if section_header.match(line):
+            name = section_header.match(line).group(1).lower()
+            in_final = name == "final answer"
+            continue
+        if in_final:
+            # Stop if another header appears (handled above) or if we hit an empty line after content.
+            out_lines.append(line)
+    if any(l.strip() for l in out_lines):
+        return "\n".join(out_lines).strip()
+
+    # Otherwise: strip common section labels if present and return the remaining text.
+    stripped = []
+    for line in lines:
+        # Remove leading "Final Answer ..." even if it's not formatted as a header.
+        line2 = re.sub(r"(?im)^\s*(?:\d+\.\s*)?(?:\*\*)?\s*final answer\s*(?:\*\*)?\s*:?\s*", "", line)
+        line2 = re.sub(r"(?im)^\s*(?:\d+\.\s*)?(?:\*\*)?\s*(concept|formula/setup|step-by-step|optional check)\s*(?:\*\*)?\s*:?\s*", "", line2)
+        stripped.append(line2)
+    return "\n".join(stripped).strip()
+
 
 # Allow running from repo root
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -25,6 +122,30 @@ logger = logging.getLogger(__name__)
 def initialize_graph():
     logger.info("Initializing workflow graph for Streamlit")
     return create_runtime_graph()
+
+
+@st.cache_resource
+def warm_runtime_resources() -> bool:
+    """
+    Warm expensive runtime resources (embeddings + Chroma) only when needed.
+
+    Putting model/DB warm-up at app startup delays the first paint and keeps the
+    Streamlit loading screen (logo/spinner) visible for a long time. We warm on
+    the first user query instead.
+    """
+    from prototype.db import get_embedding_model as get_db_embedding_model
+    from prototype.chroma_setup import get_chroma_client, get_chroma_collection
+
+    get_db_embedding_model()
+
+    client = get_chroma_client()
+    collection = get_chroma_collection(client)
+    try:
+        collection.count()
+    except Exception as exc:
+        logger.warning("ChromaDB warm-up count failed: %s", exc)
+
+    return True
 
 
 def _init_session_state() -> None:
@@ -48,6 +169,7 @@ def _inject_css(has_messages: bool) -> None:
             --text-main: #f4f4f7;
             --text-muted: #a9adbd;
             --border: #2d2f36;
+            --card: #232428;
         }
 
         .stApp {
@@ -60,7 +182,7 @@ def _inject_css(has_messages: bool) -> None:
         }
 
         .block-container {
-            max-width: 600px;
+            max-width: 820px;
             margin: 0 auto;
             padding-top: 2rem;
             padding-bottom: 7rem;
@@ -152,9 +274,45 @@ def _inject_css(has_messages: bool) -> None:
             font-size: 1.05rem !important;
         }
 
+        /* Modernize default Streamlit chat */
+        section.main > div {
+            padding-bottom: 6rem;
+        }
+
+        div[data-testid="stChatMessage"] > div {
+            border-radius: 14px;
+        }
+
+        div[data-testid="stChatMessage"] p,
+        div[data-testid="stChatMessage"] li {
+            line-height: 1.65;
+            font-size: 1.05rem;
+        }
+
+        /* Diagnostics card */
+        .diag-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.25rem 1.25rem 0.75rem 1.25rem;
+            margin: 1rem 0 1.25rem 0;
+        }
+        .diag-title {
+            font-size: 1.1rem;
+            font-weight: 650;
+            margin-bottom: 0.75rem;
+            color: var(--text-main);
+        }
         .stExpander {
-            background: #232428 !important;
+            background: var(--card) !important;
             border: 1px solid var(--border) !important;
+            border-radius: 14px !important;
+        }
+        div[data-testid="stMetric"] {
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 14px;
+            padding: 0.65rem 0.8rem;
         }
         </style>
         """,
@@ -164,8 +322,6 @@ def _inject_css(has_messages: bool) -> None:
 
 # ---------------- CHAT ---------------- #
 def _render_chat_container(messages):
-    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-
     if not messages:
         st.markdown(
             """
@@ -175,24 +331,16 @@ def _render_chat_container(messages):
             """,
             unsafe_allow_html=True,
         )
-    else:
-        for message in messages:
-            role = message.get("role", "assistant")
-            content = message.get("content", "")
-            safe_content = html.escape(content).replace("\n", "<br>")
+        return
 
-            if role == "user":
-                st.markdown(
-                    f"<div class='chat-row user'><div class='chat-bubble user'>{safe_content}</div></div>",
-                    unsafe_allow_html=True,
-                )
+    for message in messages:
+        role = message.get("role", "assistant") or "assistant"
+        content = message.get("content", "") or ""
+        with st.chat_message(role):
+            if role == "assistant":
+                render_math_or_text(content)
             else:
-                st.markdown(
-                    f"<div class='chat-row assistant'><div class='chat-bubble assistant'>{safe_content}</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-    st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown(content)
 
 
 def _render_input_form():
@@ -211,7 +359,14 @@ def _render_diagnostics(result: Dict[str, object]) -> None:
 
     if summarizer_meta.get("mode") == "fallback":
         reason = summarizer_meta.get("reason", "fallback summary used")
-        st.warning(f"Summary fallback active: {reason}")
+        provider = summarizer_meta.get("provider", "?")
+        # Show more details if available
+        error_details = ""
+        if reason and ("llm_init_error" in reason or "llm_error" in reason):
+            error_details = f"\n**LLM Error Details:** {reason}"
+        st.warning(
+            f"Summary fallback active (provider: {provider}): {reason}{error_details}"
+        )
 
     if reflection_source and reflection_source != "llm":
         st.info(f"Reflection fallback active: {reflection_source}")
@@ -226,10 +381,12 @@ def _render_diagnostics(result: Dict[str, object]) -> None:
     c4.metric("Iterations", str(result.get("iteration_count", 0)))
 
     with st.expander("Open detailed diagnostics", expanded=False):
-        t1, t2, t3, t4 = st.tabs(["Answer", "Retrieval", "Reflection", "Metadata"])
+        t1, t2, t3, t4, t5, t6 = st.tabs(
+            ["Answer", "Retrieval", "Reflection", "Tools", "Metadata", "LLM"]
+        )
 
         with t1:
-            st.markdown(result.get("summary", "[No summary generated]"))
+            render_math_or_text(result.get("summary", "[No summary generated]"))
 
         with t2:
             st.write(f"Retrieved: {len(docs)} documents")
@@ -242,7 +399,37 @@ def _render_diagnostics(result: Dict[str, object]) -> None:
             st.json(metrics)
 
         with t4:
+            pre_tools = metadata.get("decisions", {}).get("pre_tools", {}) or {}
+            calc = pre_tools.get("calculator_result")
+            tool_results = result.get("tool_results")
+
+            if calc:
+                st.markdown("### Calculator")
+                render_math_or_text(str(calc))
+
+            if tool_results:
+                st.markdown("### Tool Results")
+                render_math_or_text(str(tool_results))
+
+            if not calc and not tool_results:
+                st.info("No tool output for this run.")
+
+        with t5:
             st.json(metadata)
+
+        with t6:
+            llm_calls = metadata.get("llm_calls", []) or []
+            if not llm_calls:
+                st.info("No LLM call diagnostics recorded for this run.")
+            else:
+                failures = [
+                    c
+                    for c in llm_calls
+                    if isinstance(c, dict) and not c.get("ok", True)
+                ]
+                if failures:
+                    st.warning(f"LLM call failures: {len(failures)}")
+                st.dataframe(llm_calls, width="stretch")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -258,9 +445,15 @@ def _run_query(graph, query: str) -> Dict[str, Any]:
 
 # ---------------- MAIN ---------------- #
 def main():
-
-    # Advanced optimization: Singleton cache for ChromaDB and dummy query to fully warm up
-    if "_embedding_and_chromadb_warmed" not in st.session_state:
+    # Startup warm-up delays first paint; warm on first query instead.
+    # Set PREWARM_ON_STARTUP=1 if you prefer slower initial load and faster first query.
+    prewarm_on_startup = os.getenv("PREWARM_ON_STARTUP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if prewarm_on_startup and "_embedding_and_chromadb_warmed" not in st.session_state:
         try:
             from prototype.chroma_setup import (
                 get_embedding_model,
@@ -344,16 +537,24 @@ def main():
             st.error("Please enter a query.")
             return
 
-        graph = initialize_graph()
-
         with loading_mount.container():
-            with st.spinner("Thinking..."):
+            with st.spinner("Preparing..."):
+                try:
+                    warm_runtime_resources()
+                except Exception:
+                    logger.warning(
+                        "Warm-up failed; continuing without warm-up",
+                        exc_info=True,
+                    )
+                graph = initialize_graph()
                 result = _run_query(graph, cleaned_query)
 
         st.session_state.last_result = result
         _append_chat_message("user", cleaned_query)
 
-        _append_chat_message("assistant", result.get("summary", ""))
+        # Chat shows a compact answer (no "Final Answer" label); full output stays in diagnostics.
+        summary = result.get("summary", "") or ""
+        _append_chat_message("assistant", _extract_chat_answer(summary))
 
         st.rerun()
 

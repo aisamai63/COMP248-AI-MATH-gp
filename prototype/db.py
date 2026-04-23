@@ -9,7 +9,7 @@ import time
 from typing import List, Dict, Optional
 import logging
 from functools import lru_cache
-from prototype.config import rag_config, excerpt_config, db_config
+from prototype.config import rag_config, excerpt_config, db_config, ingestion_config
 
 try:
     import chromadb
@@ -98,9 +98,50 @@ def get_embedding_model():
     except Exception:
         pass
 
-    from sentence_transformers import SentenceTransformer
+    def _proxy_points_to_dead_localhost() -> bool:
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+            value = (os.environ.get(name) or "").strip().lower()
+            if "127.0.0.1:9" in value or "localhost:9" in value:
+                return True
+        return False
 
-    return SentenceTransformer(rag_config.EMBEDDING_MODEL)
+    def _make_hash_embedder():
+        import numpy as np
+        from sklearn.feature_extraction.text import HashingVectorizer
+
+        class _HashingEmbedder:
+            def __init__(self, n_features: int = 512):
+                self.vectorizer = HashingVectorizer(
+                    n_features=n_features,
+                    alternate_sign=False,
+                    norm=None,
+                )
+
+            def encode(self, texts):
+                matrix = self.vectorizer.transform(texts)
+                dense = matrix.toarray().astype(np.float32)
+                norms = np.linalg.norm(dense, axis=1, keepdims=True) + 1e-8
+                return dense / norms
+
+        return _HashingEmbedder()
+
+    if _proxy_points_to_dead_localhost():
+        return _make_hash_embedder()
+
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        return SentenceTransformer(rag_config.EMBEDDING_MODEL)
+    except Exception as exc:
+        logging.warning(
+            "SentenceTransformer model unavailable; using offline hashing embedder. Reason: %s",
+            exc,
+        )
+        try:
+            return _make_hash_embedder()
+        except Exception as fallback_exc:
+            logging.error("Offline hashing embedder unavailable: %s", fallback_exc)
+            raise
 
 
 def _extract_excerpt(
@@ -179,6 +220,8 @@ class KBClient:
         self.client = None
         self.collection = None
         self.embedding_model = None
+        self.chroma_query_failures = 0
+        self.max_chroma_query_failures = 3
 
         if use_chromadb and CHROMADB_AVAILABLE:
             self._initialize_chroma()
@@ -195,13 +238,151 @@ class KBClient:
                 distance_metric=db_config.CHROMADB_DISTANCE_METRIC,
             )
             logging.info("ChromaDB KBClient initialized")
+            self.use_chromadb = True
+            self.chroma_query_failures = 0
+
+            # Reliability: if the collection is empty, bootstrap with local JSONL docs
+            # so the system still demonstrates Chroma-based RAG even on fresh/ephemeral DBs.
+            try:
+                if self.collection is not None and self.collection.count() == 0:
+                    self._bootstrap_collection_from_jsonl()
+            except Exception as exc:
+                logging.warning("ChromaDB bootstrap skipped/failed: %s", exc)
         except BaseException as e:
             if _is_fatal_base_exception(e):
                 raise
             logging.warning(f"Failed to initialize ChromaDB client: {e}")
+            # Retry once with a dedicated writable runtime fallback directory.
+            if self.persist_directory != db_config.CHROMADB_RUNTIME_FALLBACK_DIR:
+                try:
+                    from prototype.chroma_setup import (
+                        get_chroma_client,
+                        get_chroma_collection,
+                    )
+
+                    logging.warning(
+                        "Retrying ChromaDB init with fallback dir: %s",
+                        db_config.CHROMADB_RUNTIME_FALLBACK_DIR,
+                    )
+                    self.persist_directory = db_config.CHROMADB_RUNTIME_FALLBACK_DIR
+                    self.client = get_chroma_client(
+                        persist_directory=self.persist_directory
+                    )
+                    self.collection = get_chroma_collection(
+                        self.client,
+                        collection_name=self.collection_name,
+                        distance_metric=db_config.CHROMADB_DISTANCE_METRIC,
+                    )
+                    self.use_chromadb = True
+                    self.chroma_query_failures = 0
+                    logging.info("ChromaDB KBClient initialized via fallback directory")
+                    return
+                except BaseException as retry_exc:
+                    if _is_fatal_base_exception(retry_exc):
+                        raise
+                    logging.warning("Fallback ChromaDB initialization failed: %s", retry_exc)
+
             self.use_chromadb = False
             self.client = None
             self.collection = None
+
+    def _bootstrap_collection_from_jsonl(self) -> None:
+        """Ingest local JSONL docs into an empty Chroma collection (best-effort)."""
+        if self.collection is None:
+            return
+
+        jsonl_path = DATA_PATH
+        if not os.path.exists(jsonl_path):
+            logging.warning("Bootstrap JSONL not found: %s", jsonl_path)
+            return
+
+        try:
+            docs = []
+            with open(jsonl_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        docs.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logging.warning("Failed reading bootstrap JSONL: %s", exc)
+            return
+
+        if not docs:
+            logging.warning("Bootstrap JSONL had no documents.")
+            return
+
+        chunk_size = int(getattr(ingestion_config, "CHUNK_SIZE", 700))
+        overlap = int(getattr(ingestion_config, "CHUNK_OVERLAP", 100))
+        overlap = max(0, min(overlap, chunk_size - 1))
+        step = max(1, chunk_size - overlap)
+
+        chunk_texts: List[str] = []
+        chunk_ids: List[str] = []
+        metadatas: List[Dict] = []
+
+        for doc in docs:
+            doc_id = str(doc.get("id") or doc.get("title") or "doc").strip() or "doc"
+            title = str(doc.get("title") or doc_id)
+            source = str(doc.get("source") or "jsonl")
+            text = str(doc.get("text") or "")
+            if not text:
+                continue
+
+            if len(text) <= chunk_size:
+                parts = [text]
+            else:
+                parts = []
+                start = 0
+                while start < len(text):
+                    end = min(start + chunk_size, len(text))
+                    chunk = text[start:end].strip()
+                    if chunk and len(chunk) > 50:
+                        parts.append(chunk)
+                    start += step
+
+            for idx, chunk in enumerate(parts):
+                chunk_ids.append(f"{doc_id}_{idx}")
+                chunk_texts.append(chunk)
+                metadatas.append(
+                    {
+                        "original_id": doc_id,
+                        "title": title,
+                        "source": source,
+                        "chunk_num": str(idx),
+                    }
+                )
+
+        if not chunk_texts:
+            logging.warning("No bootstrap chunks produced.")
+            return
+
+        model = self._get_embedding_model()
+        batch_size = int(getattr(ingestion_config, "INGEST_BATCH_SIZE", 100))
+        total_added = 0
+
+        for start in range(0, len(chunk_texts), batch_size):
+            end = min(start + batch_size, len(chunk_texts))
+            texts = chunk_texts[start:end]
+            ids = chunk_ids[start:end]
+            metas = metadatas[start:end]
+            embeddings = model.encode(texts).tolist()
+
+            try:
+                self.collection.add(
+                    ids=ids,
+                    documents=texts,
+                    metadatas=metas,
+                    embeddings=embeddings,
+                )
+                total_added += len(ids)
+            except Exception as exc:
+                logging.warning("Bootstrap add failed for batch: %s", exc)
+
+        logging.info("ChromaDB bootstrap complete. Added %d chunks.", total_added)
 
     def _get_embedding_model(self):
         if self.embedding_model is None:
@@ -313,12 +494,22 @@ class KBClient:
             try:
                 chroma_docs = self._query_chromadb(query, k)
                 if chroma_docs:
+                    self.chroma_query_failures = 0
                     return chroma_docs
             except BaseException as e:
                 if _is_fatal_base_exception(e):
                     raise
                 logging.warning(f"ChromaDB query failed, using fallback: {e}")
-                self.use_chromadb = False
+                self.chroma_query_failures += 1
+                if self.chroma_query_failures >= self.max_chroma_query_failures:
+                    self.use_chromadb = False
+                    logging.warning(
+                        "Disabling ChromaDB after %d consecutive query failures.",
+                        self.chroma_query_failures,
+                    )
+                else:
+                    # Keep Chroma enabled for transient errors and reinitialize.
+                    self._initialize_chroma()
 
         return self._query_fallback(query, k)
 

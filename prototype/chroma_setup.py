@@ -19,6 +19,7 @@ import logging
 import shutil
 import os
 import glob
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -57,6 +58,20 @@ def _backup_corrupt_chroma_dir(persist_directory: str) -> Optional[Path]:
     return backup_dir
 
 
+
+def _ensure_writable_directory(directory: str) -> bool:
+    """Return True only if a directory is writable for runtime database files."""
+    try:
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        probe_file = path / ".write_probe"
+        probe_file.write_text("ok", encoding="utf-8")
+        probe_file.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 def get_chroma_client(
     persist_directory: Optional[str] = None, allow_reset: bool = False
 ) -> chromadb.Client:
@@ -74,72 +89,107 @@ def get_chroma_client(
     if persist_directory is None:
         persist_directory = CHROMA_DB_DIR
 
-    # Ensure directory exists
-    Path(persist_directory).mkdir(parents=True, exist_ok=True)
-
-    # Create persistent client with the new Chroma API.
     settings = Settings(
         anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
         allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
     )
 
-    def _build_persistent_client() -> chromadb.Client:
-        return chromadb.PersistentClient(
-            path=persist_directory,
-            settings=settings,
-        )
+    def _build_persistent_client(path: str) -> chromadb.Client:
+        return chromadb.PersistentClient(path=path, settings=settings)
 
-    try:
-        client = _build_persistent_client()
-        logger.info(
-            f"✓ ChromaDB client initialized (persisting to {persist_directory})"
-        )
-        return client
+    temp_candidates = []
+    for name in ("LOCALAPPDATA", "TEMP", "TMP"):
+        value = (os.environ.get(name) or "").strip()
+        if not value:
+            continue
+        temp_candidates.append(value)
+        if name == "LOCALAPPDATA":
+            temp_candidates.append(os.path.join(value, "Temp"))
+    temp_candidates.append(tempfile.gettempdir())
 
-    except BaseException as e:
-        if _is_fatal_base_exception(e):
-            raise
-        logger.error(f"✗ Failed to initialize ChromaDB client: {e}")
+    runtime_temp_dir = None
+    for temp_root in temp_candidates:
+        candidate = os.path.join(temp_root, "comp248_chroma_runtime")
+        if _ensure_writable_directory(candidate):
+            runtime_temp_dir = candidate
+            break
+
+    if runtime_temp_dir is None:
+        runtime_temp_dir = os.path.join(tempfile.gettempdir(), "comp248_chroma_runtime")
+    candidate_dirs = [
+        persist_directory,
+        db_config.CHROMADB_RUNTIME_FALLBACK_DIR,
+        runtime_temp_dir,
+    ]
+
+    first_error = None
+    seen = set()
+    unique_dirs = []
+    for candidate in candidate_dirs:
+        resolved = str(Path(candidate).resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_dirs.append(resolved)
+
+    for index, active_dir in enumerate(unique_dirs):
+        if not _ensure_writable_directory(active_dir):
+            logger.warning("ChromaDB directory is not writable: %s", active_dir)
+            continue
 
         try:
-            backup_dir = _backup_corrupt_chroma_dir(persist_directory)
-            if backup_dir is not None:
-                logger.warning(
-                    "Moved possibly-corrupt Chroma directory to '%s'; retrying fresh DB.",
-                    backup_dir,
+            client = _build_persistent_client(active_dir)
+            logger.info("ChromaDB client initialized (persisting to %s)", active_dir)
+            return client
+        except BaseException as e:
+            if _is_fatal_base_exception(e):
+                raise
+            if first_error is None:
+                first_error = e
+            logger.error("Failed to initialize ChromaDB client at %s: %s", active_dir, e)
+
+            if index == 0:
+                try:
+                    backup_dir = _backup_corrupt_chroma_dir(active_dir)
+                    if backup_dir is not None:
+                        logger.warning(
+                            "Moved possibly-corrupt Chroma directory to '%s'; retrying fresh DB.",
+                            backup_dir,
+                        )
+                        client = _build_persistent_client(active_dir)
+                        logger.info(
+                            "ChromaDB client initialized after recovery (persisting to %s)",
+                            active_dir,
+                        )
+                        return client
+                except BaseException as retry_exc:
+                    if _is_fatal_base_exception(retry_exc):
+                        raise
+                    logger.error("ChromaDB recovery retry failed: %s", retry_exc)
+
+            try:
+                legacy_settings = Settings(
+                    is_persistent=True,
+                    persist_directory=active_dir,
+                    anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
+                    allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
                 )
-                client = _build_persistent_client()
-                logger.info(
-                    "✓ ChromaDB client initialized after recovery (persisting to %s)",
-                    persist_directory,
+                client = chromadb.Client(settings=legacy_settings)
+                logger.warning(
+                    "ChromaDB initialized via legacy client compatibility mode at %s",
+                    active_dir,
                 )
                 return client
-        except BaseException as retry_exc:
-            if _is_fatal_base_exception(retry_exc):
-                raise
-            logger.error("✗ ChromaDB recovery retry failed: %s", retry_exc)
+            except BaseException as legacy_exc:
+                if _is_fatal_base_exception(legacy_exc):
+                    raise
+                logger.error(
+                    "ChromaDB legacy compatibility mode failed at %s: %s",
+                    active_dir,
+                    legacy_exc,
+                )
 
-        # Compatibility fallback: older client initialization path can work on
-        # some environments where the rust-backed PersistentClient fails.
-        try:
-            legacy_settings = Settings(
-                is_persistent=True,
-                persist_directory=persist_directory,
-                anonymized_telemetry=not db_config.CHROMADB_DISABLE_TELEMETRY,
-                allow_reset=allow_reset or db_config.CHROMADB_ALLOW_RESET,
-            )
-            client = chromadb.Client(settings=legacy_settings)
-            logger.warning(
-                "ChromaDB initialized via legacy client compatibility mode at %s",
-                persist_directory,
-            )
-            return client
-        except BaseException as legacy_exc:
-            if _is_fatal_base_exception(legacy_exc):
-                raise
-            logger.error("✗ ChromaDB legacy compatibility mode failed: %s", legacy_exc)
-
-        raise RuntimeError(f"ChromaDB initialization failed: {e}") from None
+    raise RuntimeError(f"ChromaDB initialization failed: {first_error}") from None
 
 
 def get_chroma_collection(
@@ -159,11 +209,11 @@ def get_chroma_collection(
                 "distance_metric": distance_metric,
             },
         )
-        logger.info(f"✓ Collection '{collection_name}' ready")
+        logger.info(f"âœ“ Collection '{collection_name}' ready")
         return collection
 
     except Exception as e:
-        logger.error(f"✗ Failed to get/create collection: {e}")
+        logger.error(f"âœ— Failed to get/create collection: {e}")
         raise
 
 
@@ -277,7 +327,7 @@ def get_embedding_model(model_name: str = rag_config.EMBEDDING_MODEL):
                     continue
 
                 _EMBEDDING_MODEL = SentenceTransformer(str(cand_path))
-                logger.info("✓ Embedding model loaded from local cache: %s", cand_path)
+                logger.info("âœ“ Embedding model loaded from local cache: %s", cand_path)
                 return _EMBEDDING_MODEL
             except Exception:
                 logger.debug(
@@ -286,17 +336,17 @@ def get_embedding_model(model_name: str = rag_config.EMBEDDING_MODEL):
 
         # Fallback: load by model name (may download from Hugging Face)
         _EMBEDDING_MODEL = SentenceTransformer(model_name)
-        logger.info(f"✓ Embedding model loaded: {model_name}")
+        logger.info(f"âœ“ Embedding model loaded: {model_name}")
         return _EMBEDDING_MODEL
     except ImportError as e:
         logger.error(
-            "✗ Failed to import sentence-transformers dependencies: %s. "
+            "âœ— Failed to import sentence-transformers dependencies: %s. "
             "Try reinstalling from prototype/requirements.txt.",
             e,
         )
         raise
     except Exception as e:
-        logger.error(f"✗ Failed to load embedding model {model_name}: {e}")
+        logger.error(f"âœ— Failed to load embedding model {model_name}: {e}")
         raise
 
 
@@ -319,7 +369,7 @@ def check_collection_status(collection: chromadb.Collection) -> dict:
         return status
 
     except Exception as e:
-        logger.error(f"✗ Failed to check collection status: {e}")
+        logger.error(f"âœ— Failed to check collection status: {e}")
         return {"status": "error", "error": str(e)}
 
 
@@ -339,15 +389,15 @@ def reset_collection(
     """
     try:
         client.delete_collection(name=collection_name)
-        logger.warning(f"🗑️  Deleted collection '{collection_name}'")
+        logger.warning(f"ðŸ—‘ï¸  Deleted collection '{collection_name}'")
 
         # Recreate empty collection
         new_collection = get_chroma_collection(client, collection_name)
-        logger.info(f"✓ Created new empty collection '{collection_name}'")
+        logger.info(f"âœ“ Created new empty collection '{collection_name}'")
         return new_collection
 
     except Exception as e:
-        logger.error(f"✗ Failed to reset collection: {e}")
+        logger.error(f"âœ— Failed to reset collection: {e}")
         raise
 
 
@@ -359,8 +409,9 @@ if __name__ == "__main__":
     collection = get_chroma_collection(client)
     status = check_collection_status(collection)
 
-    print(f"\n📊 Collection Status:")
+    print(f"\nðŸ“Š Collection Status:")
     print(f"  Name: {status['collection_name']}")
     print(f"  Documents: {status['document_count']}")
     print(f"  Status: {status['status']}")
-    print(f"\n✓ ChromaDB is ready to use!")
+    print(f"\nâœ“ ChromaDB is ready to use!")
+

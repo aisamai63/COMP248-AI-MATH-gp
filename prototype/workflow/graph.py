@@ -111,7 +111,16 @@ class MathInquiriesGraph:
         retriever = RetrieverAgent(self.retriever)
         summarizer = SummarizerAgent(use_llm=True)
         reflector = ReflectiveAgent(use_llm=not runtime_config.FAST_MODE)
-        tool_agent = ToolAgent()
+        pre_tools = ToolAgent(
+            allowed_tools=["calculator"],
+            decision_key="pre_tools",
+            expose_results=False,
+        )
+        tool_agent = ToolAgent(
+            allowed_tools=["web_search"],
+            decision_key="tool_agent",
+            expose_results=True,
+        )
 
         # Define node functions (wrapper for agents)
         def planner_node(state: WorkflowState) -> WorkflowState:
@@ -174,6 +183,20 @@ class MathInquiriesGraph:
                         }
                     ),
                 },
+            )
+            return updated
+
+        def pre_tools_node(state: WorkflowState) -> WorkflowState:
+            """Pre-tools node: run calculator first so LLM can explain the result."""
+            started = time.perf_counter()
+            updated = pre_tools.run(state)
+            elapsed = time.perf_counter() - started
+            logger.info("Timing | pre_tools | %.3fs", elapsed)
+            updated["metadata"]["timestamps"]["pre_tools_total"] = elapsed
+            _record_node_metadata(
+                updated,
+                "pre_tools",
+                updated.get("metadata", {}).get("decisions", {}).get("pre_tools", {}),
             )
             return updated
 
@@ -249,13 +272,15 @@ class MathInquiriesGraph:
         # Add nodes
         graph.add_node("planner", planner_node)
         graph.add_node("retriever", retriever_node)
+        graph.add_node("pre_tools", pre_tools_node)
         graph.add_node("summarizer", summarizer_node)
         graph.add_node("reflector", reflector_node)
         graph.add_node("tool_agent", tool_node)
 
         # Add edges: define the flow
         graph.add_edge("planner", "retriever")
-        graph.add_edge("retriever", "summarizer")
+        graph.add_edge("retriever", "pre_tools")
+        graph.add_edge("pre_tools", "summarizer")
         graph.add_edge("summarizer", "reflector")
 
         # Conditional edge: reflector decides continue or retry via planner.
@@ -294,6 +319,12 @@ class MathInquiriesGraph:
         # If no metrics yet, continue to tool phase (safe default).
         if not state["reflection_metrics"]:
             return "continue"
+
+        # Respect the reflector's explicit retry signal when present. This is
+        # important for reliability when reflection falls back to heuristics.
+        metrics = state.get("reflection_metrics", {}) or {}
+        if "should_retry" in metrics:
+            return "retry" if bool(metrics.get("should_retry")) else "continue"
 
         # FAST_MODE: skip iterative retry loop for near-instant responses.
         if runtime_config.FAST_MODE:
