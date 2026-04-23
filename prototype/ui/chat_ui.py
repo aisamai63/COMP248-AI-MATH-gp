@@ -1,7 +1,3 @@
-def _escape_message(content: str) -> str:
-    return html.escape(content).replace("\n", "<br>")
-
-
 """Streamlit chat UI helpers for the Math Inquiries frontend.
 
 This module contains only presentation logic: CSS, layout, message rendering,
@@ -15,6 +11,10 @@ from typing import Dict, List, Tuple
 
 import streamlit as st
 from streamlit.components.v1 import html as st_html
+
+
+def _escape_message(content: str) -> str:
+    return html.escape(content).replace("\n", "<br>")
 
 
 def apply_chat_css() -> None:

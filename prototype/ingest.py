@@ -98,6 +98,10 @@ def load_pdf_documents(data_directory: str) -> List[Dict]:
     """
     documents = []
 
+    if os.getenv("SKIP_PDF_INGESTION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        logger.info("SKIP_PDF_INGESTION is enabled; skipping PDF loading.")
+        return documents
+
     try:
         from pypdf import PdfReader
 

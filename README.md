@@ -156,6 +156,31 @@ python ingest.py
 .\.venv\Scripts\python.exe -m streamlit run prototype/app.py
 ```
 
+## Deploy on Render (Streamlit)
+
+This repo includes a Render Blueprint (`render.yaml`) and a startup script (`render_start.sh`).
+
+1) Push the repo to GitHub (or GitLab) and connect it in Render.
+2) In Render, create a **New > Blueprint** (recommended) or a **Web Service**.
+
+If you deploy as a **Web Service** (manual settings):
+
+- **Build Command:** `pip install -r prototype/requirements.txt`
+- **Start Command:** `bash render_start.sh`
+
+Recommended Render settings:
+
+- Add a **Disk** (e.g. 1GB) and mount it to `/var/data`
+- Set `CHROMA_DB_DIR=/var/data/chroma_db` (so Chroma persists across deploys)
+- Set your secrets in Render **Environment** (do not commit keys):
+  - `LLM_PROVIDER` = `openai` | `mistral` | `gemini`
+  - `OPENAI_API_KEY` (or `MISTRAL_API_KEY` / `GEMINI_API_KEY`)
+
+Notes:
+
+- First deploy can take time because embeddings/models download and ingestion may run once (`AUTO_INGEST=1`).
+- To speed up small instances, set `SKIP_PDF_INGESTION=1` (ingests only `prototype/data/sample_docs.jsonl`).
+
 If you see `ModuleNotFoundError` (for example `No module named 'langgraph'`), reinstall dependencies in the same interpreter used to run Streamlit:
 
 ```powershell
